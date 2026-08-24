@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 pub const CACHE_FILENAME: &str = "cache.redb";
 
@@ -53,6 +53,44 @@ const SUBTITLES_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("s
 /// OpenSubtitles search results keyed by `"<tmdb_id>\x01<lang3>"`. Value is the
 /// resolved subtitle's cid, or the literal `"null"` negative-cache sentinel.
 const OPENSUBTITLES_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("opensubtitles");
+
+
+// ── music-family tables (MusicBrainz / Internet Archive / YouTube / Jamendo) ──
+
+/// Ranked MusicBrainz search results keyed by `"<entity>\x01<normalised text>"`.
+const MB_SEARCH_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("mb_search");
+/// Release-group detail keyed by its MBID.
+const MB_RELEASE_GROUP_TABLE: TableDefinition<'_, &str, &str> =
+    TableDefinition::new("mb_release_group");
+/// Artist detail keyed by its MBID.
+const MB_ARTIST_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("mb_artist");
+/// A release-group's canonical track list keyed by the release-group MBID.
+const MB_TRACKLIST_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("mb_tracklist");
+/// Internet Archive per-item file listing keyed by the item identifier.
+const IA_ITEM_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("ia_item");
+/// An artist's YouTube channel keys, keyed by artist MBID. See
+/// `youtube::ChannelKeys`.
+///
+/// ⚠ **Only ever holds a POSITIVE result.** MusicBrainz answers `503` when
+/// crowded and the client reports every failure as `None`, so caching a
+/// negative would freeze a transport hiccup into "this artist has no channel"
+/// — the exact fabrication the match probe hit (study §7.5).
+const YT_CHANNEL_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("yt_channel");
+/// Piped `music_songs` results keyed by the normalised search text.
+const YT_SEARCH_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("yt_search");
+/// Jamendo per-track detail keyed by the Jamendo track id. Permanent: a track
+/// id names an immutable recording, and its licence, artist credit and
+/// download URL do not change under it.
+const JAMENDO_TRACK_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("jamendo_track");
+/// Jamendo API calls spent, keyed by UTC `YYYY-MM`.
+///
+/// ⚠ **This table is not a cache — it is an accounting ledger, and losing it
+/// loses money.** Every other table here can be deleted to reclaim disk with
+/// no consequence beyond a slower next request. Deleting this one resets the
+/// month's spend to zero while Jamendo's own counter keeps climbing, so the
+/// feeder cheerfully spends a quota it has already exhausted and every call
+/// fails for the rest of the month. See `consts::JAMENDO_MONTHLY_QUOTA`.
+const JAMENDO_QUOTA_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("jamendo_quota");
 /// Small durable plugin scratch values that must survive a restart but aren't
 /// content-derived — today, the torznab plugin's Prowlarr indexer-set
 /// fingerprint, so a set that changed *while the feeder was down* is still
@@ -113,12 +151,62 @@ impl MidhashCache {
             tx.open_table(SUBTITLES_TABLE)?;
             tx.open_table(OPENSUBTITLES_TABLE)?;
             tx.open_table(MISC_TABLE)?;
+            tx.open_table(MB_SEARCH_TABLE)?;
+            tx.open_table(MB_RELEASE_GROUP_TABLE)?;
+            tx.open_table(MB_ARTIST_TABLE)?;
+            tx.open_table(MB_TRACKLIST_TABLE)?;
+            tx.open_table(IA_ITEM_TABLE)?;
+            tx.open_table(YT_CHANNEL_TABLE)?;
+            tx.open_table(YT_SEARCH_TABLE)?;
+            tx.open_table(JAMENDO_TRACK_TABLE)?;
+            tx.open_table(JAMENDO_QUOTA_TABLE)?;
             tx.commit()?;
         }
         Ok(Self { db: Arc::new(db) })
     }
 
     str_table_accessors!(get_midhash, put_midhash, MIDHASH_TABLE);
+
+    // ── music-family accessors ──
+    str_table_accessors!(get_mb_search, put_mb_search, MB_SEARCH_TABLE);
+    str_table_accessors!(get_mb_release_group, put_mb_release_group, MB_RELEASE_GROUP_TABLE);
+    str_table_accessors!(get_mb_artist, put_mb_artist, MB_ARTIST_TABLE);
+    str_table_accessors!(get_mb_tracklist, put_mb_tracklist, MB_TRACKLIST_TABLE);
+    str_table_accessors!(get_ia_item, put_ia_item, IA_ITEM_TABLE);
+    str_table_accessors!(get_yt_channel, put_yt_channel, YT_CHANNEL_TABLE);
+    str_table_accessors!(get_yt_search, put_yt_search, YT_SEARCH_TABLE);
+    str_table_accessors!(get_jamendo_track, put_jamendo_track, JAMENDO_TRACK_TABLE);
+
+    pub fn jamendo_quota_spend(
+        &self,
+        month: &str,
+        budget: u64,
+    ) -> Result<Option<u64>, redb::Error> {
+        let tx = self.db.begin_write()?;
+        let spent_after;
+        {
+            let mut table = tx.open_table(JAMENDO_QUOTA_TABLE)?;
+            let spent = table.get(month)?.map(|v| v.value()).unwrap_or(0);
+            if spent >= budget {
+                drop(table);
+                // Nothing was written; abort rather than commit an empty txn.
+                tx.abort()?;
+                return Ok(None);
+            }
+            spent_after = spent + 1;
+            table.insert(month, spent_after)?;
+        }
+        tx.commit()?;
+        Ok(Some(spent_after))
+    }
+
+    /// Calls already spent in `month`. Read-only — for health and the config
+    /// surface, never on the request path.
+    pub fn jamendo_quota_used(&self, month: &str) -> Result<u64, redb::Error> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(JAMENDO_QUOTA_TABLE)?;
+        Ok(table.get(month)?.map(|v| v.value()).unwrap_or(0))
+    }
 
     str_table_accessors!(
         /// Read a durable plugin scratch value (see [`MISC_TABLE`]).
@@ -349,5 +437,70 @@ mod tests {
         assert_eq!(cache.entry_count().unwrap(), 2);
         cache.put_midhash("a", "x2").unwrap();
         assert_eq!(cache.entry_count().unwrap(), 2);
+    }
+}
+
+/// Cache key for a search: entity type plus the normalised query text.
+///
+/// Normalisation is lowercase + whitespace-collapse only. Deliberately not
+/// more aggressive: MusicBrainz treats punctuation as significant (`Re:ZERO`,
+/// `M!LK`, `!!!` are all real artist names), so stripping it would collapse
+/// distinct queries onto one cache entry and serve the wrong answer.
+pub fn search_key(entity: &str, text: &str) -> String {
+    let normalised = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    format!("{entity}\u{1}{normalised}")
+}
+
+#[cfg(test)]
+mod music_table_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn round_trips_each_table_independently() {
+        let dir = tempdir().expect("tempdir");
+        let c = MidhashCache::open(dir.path()).expect("open");
+
+        c.put_mb_search("k", "v-search").unwrap();
+        c.put_mb_release_group("k", "v-rg").unwrap();
+        c.put_mb_artist("k", "v-artist").unwrap();
+        c.put_mb_tracklist("k", "v-tracks").unwrap();
+        c.put_ia_item("k", "v-ia").unwrap();
+
+        // Same key in five tables must not collide.
+        assert_eq!(c.get_mb_search("k").unwrap().as_deref(), Some("v-search"));
+        assert_eq!(c.get_mb_release_group("k").unwrap().as_deref(), Some("v-rg"));
+        assert_eq!(c.get_mb_artist("k").unwrap().as_deref(), Some("v-artist"));
+        assert_eq!(c.get_mb_tracklist("k").unwrap().as_deref(), Some("v-tracks"));
+        assert_eq!(c.get_ia_item("k").unwrap().as_deref(), Some("v-ia"));
+        assert!(c.get_mb_search("absent").unwrap().is_none());
+    }
+
+    #[test]
+    fn search_key_normalises_case_and_whitespace_only() {
+        assert_eq!(
+            search_key("release-group", "  Kind   OF Blue "),
+            search_key("release-group", "kind of blue")
+        );
+        // Entity namespacing keeps an artist search off a release-group entry.
+        assert_ne!(
+            search_key("artist", "miles davis"),
+            search_key("release-group", "miles davis")
+        );
+    }
+
+    /// Punctuation is significant to MusicBrainz, so it must survive
+    /// normalisation — otherwise two genuinely different works share a cache
+    /// entry and one of them is served the other's answer.
+    #[test]
+    fn search_key_preserves_punctuation() {
+        assert_ne!(
+            search_key("artist", "m!lk"),
+            search_key("artist", "mlk"),
+        );
+        assert_ne!(
+            search_key("release-group", "re:zero"),
+            search_key("release-group", "rezero"),
+        );
     }
 }

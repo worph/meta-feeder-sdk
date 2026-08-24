@@ -423,6 +423,86 @@ fn identity_locator_cid(codec: u64, digest: &[u8]) -> String {
 /// `beetswap::incoming_stream`). The `.nzb` manifest travels separately, as an
 /// ordinary sha2-256 IPFS cid in the record's `manifest` field. See
 /// `meta-gateway/docs/others/self-hosted-usenet-indexer-study.md` §5.
+/// Custom multicodec for the **url-locator** family.
+///
+/// A CID whose *bytes are a URL string* rather than a hash of the file. It lets
+/// a record reference externally-hosted bytes without storing a raw URL field:
+/// the URL is wrapped in a CID, so it flows through every cid-shaped code path
+/// (`cids/*` membership, `/api/file/{cid}/raw`, the reverse index) exactly like
+/// a content hash — honouring `METADATA_KEYS.md` rule #5, "every byte reference
+/// is a `cid`, never a URL".
+///
+/// Contrast `ext-play` (`0x1009`), which is wire-identical apart from the
+/// codec: `0x1006` means **"fetch these bytes once and seed them"**, while
+/// `0x1009` means "open this; there are no bytes for us, ever".
+///
+/// ⚠ **Never route a url-CID through a fixed-64-byte multihash type.** An
+/// archive download URL runs to ~75 bytes, past the 62-ish ceiling of
+/// meta-share's `CidGeneric<64>` bitswap alias. That is fine — it is never
+/// bitswap *content*, and the `/raw` dispatch decodes it off the raw string
+/// before the fixed-size codec dispatch runs — but a consumer that parses it as
+/// an `MsCid` will reject a perfectly good locator.
+pub const URL_LOCATOR_CODEC: u64 = 0x1006;
+
+/// Encode an `http(s)` URL as a `0x1006` identity-multihash CIDv1.
+///
+/// The identity multihash (`0x00`) means "the digest *is* the payload", so
+/// [`decode_url_cid`] recovers the URL verbatim with zero I/O.
+///
+/// `None` for anything that is not an absolute http(s) URL — a relative or
+/// malformed value would encode fine and then fail unresolvably at play time,
+/// which is a far more expensive way to find out.
+pub fn compute_url_cid(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    Some(identity_locator_cid(URL_LOCATOR_CODEC, url.as_bytes()))
+}
+
+/// The artwork locator for a `cover` / `photo` field.
+///
+/// A thin alias over [`compute_url_cid`] that names the *intent* at the call
+/// sites: artwork is referenced by a locator cid, never by a raw `*_url` field
+/// (METADATA_KEYS rule #5). `None` for a non-http(s) URL, in which case the
+/// caller writes no artwork field at all — better a card the gate hides than
+/// one carrying an unresolvable reference.
+pub fn artwork_locator(url: &str) -> Option<String> {
+    compute_url_cid(url)
+}
+
+/// Recover the URL from a `url` locator cid — the exact inverse of
+/// [`compute_url_cid`], with no I/O.
+///
+/// `None` if `cid` is not a well-formed `0x1006` identity-multihash CIDv1 over
+/// an http(s) URL.
+pub fn decode_url_cid(cid: &str) -> Option<String> {
+    let bytes = base32_lower_decode(cid.strip_prefix('b')?)?;
+    let mut i = 0usize;
+    let mut next = || -> Option<u64> {
+        let mut n = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let b = *bytes.get(i)?;
+            i += 1;
+            n |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(n);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    };
+    if next()? != 1 || next()? != URL_LOCATOR_CODEC || next()? != 0x00 {
+        return None;
+    }
+    let len = next()? as usize;
+    let url = std::str::from_utf8(bytes.get(i..i + len)?).ok()?;
+    (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
+}
+
 pub const NZB_POSTING_CODEC: u64 = 0x1003;
 
 /// Mint an `nzb-posting` cid (`0x1003`) from a release's article Message-IDs.
@@ -1072,5 +1152,150 @@ mod tests {
         // The digest is sha256 over the newline-joined sorted set.
         let expect: [u8; 32] = Sha256::digest(b"a@x.com").into();
         assert_eq!(&decoded[5..], &expect);
+    }
+}
+
+/// RFC 4648 base32 (lowercase, no padding) → bytes. Inverse of
+/// [`base32_lower_no_padding`]; used by the identity-multihash decoders.
+fn base32_lower_decode(s: &str) -> Option<Vec<u8>> {
+    let mut acc = 0u16;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    for c in s.bytes() {
+        let v = match c {
+            b'a'..=b'z' => c - b'a',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        acc = (acc << 5) | u16::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod url_locator_wire_tests {
+    use super::*;
+
+    /// Decode a base32-lower multibase string back to bytes, so the tests can
+    /// assert the wire layout rather than an opaque string.
+    fn decode(cid: &str) -> Vec<u8> {
+        const A: &str = "abcdefghijklmnopqrstuvwxyz234567";
+        let mut bits = String::new();
+        for c in cid.strip_prefix('b').expect("multibase b").chars() {
+            let i = A.find(c).expect("base32 alphabet");
+            bits.push_str(&format!("{i:05b}"));
+        }
+        bits.as_bytes()
+            .chunks(8)
+            .filter(|c| c.len() == 8)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
+            .collect()
+    }
+
+    fn read_varint(data: &[u8], at: &mut usize) -> u64 {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let b = data[*at];
+            *at += 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return v;
+            }
+            shift += 7;
+        }
+    }
+
+    /// Pins the on-the-wire layout `METADATA_KEYS.md` §2.1 specifies. meta-share
+    /// decodes exactly this; a change here is a change to a cross-binary
+    /// contract, not an implementation detail.
+    #[test]
+    fn the_wire_layout_matches_the_specified_encoding() {
+        let url = "https://archive.org/download/item/track.flac";
+        let cid = compute_url_cid(url).expect("cid");
+        let raw = decode(&cid);
+        let mut i = 0;
+        assert_eq!(raw[i], 0x01, "CIDv1");
+        i += 1;
+        assert_eq!(read_varint(&raw, &mut i), URL_LOCATOR_CODEC);
+        assert_eq!(raw[i], 0x00, "identity multihash");
+        i += 1;
+        let len = read_varint(&raw, &mut i) as usize;
+        assert_eq!(len, url.len());
+        assert_eq!(
+            std::str::from_utf8(&raw[i..i + len]).unwrap(),
+            url,
+            "the digest IS the payload — decoding must recover the URL verbatim"
+        );
+    }
+
+    /// ⚠ A real archive URL is ~75 bytes, past the ~62-byte ceiling of a
+    /// fixed-64 multihash type. That is expected and fine (the locator is never
+    /// bitswap content), but it is the thing that trips a consumer parsing it
+    /// as an `MsCid`, so the case is pinned deliberately rather than avoided.
+    #[test]
+    fn a_long_archive_url_still_encodes() {
+        let url = "https://archive.org/download/gd1977-05-08eaton/gd77-05-08eaton-d1t01.ogg";
+        assert!(url.len() > 62, "fixture must exercise the over-64 case");
+        let cid = compute_url_cid(url).expect("cid");
+        let raw = decode(&cid);
+        let mut i = 1;
+        read_varint(&raw, &mut i);
+        i += 1;
+        let len = read_varint(&raw, &mut i) as usize;
+        assert_eq!(std::str::from_utf8(&raw[i..i + len]).unwrap(), url);
+    }
+
+    /// Two URLs are two locators — a url-CID is not byte-derivable, so it is an
+    /// address this one record advertises, never a content identity.
+    #[test]
+    fn distinct_urls_yield_distinct_locators() {
+        assert_ne!(
+            compute_url_cid("https://example.com/a.flac"),
+            compute_url_cid("https://example.com/b.flac")
+        );
+    }
+
+    /// A relative or malformed value would encode fine and then fail
+    /// unresolvably at play time — the expensive place to find out.
+    #[test]
+    fn only_absolute_http_urls_are_accepted() {
+        assert!(compute_url_cid("/download/item/track.flac").is_none());
+        assert!(compute_url_cid("ftp://example.com/x").is_none());
+        assert!(compute_url_cid("").is_none());
+        assert!(compute_url_cid("archive.org/download/x").is_none());
+        assert!(compute_url_cid("http://example.com/x").is_some());
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+
+    /// Long URLs are the whole reason this locator exists (they overflow the
+    /// fixed-size multihash buffer the `cid` crate uses), so the round trip is
+    /// pinned at a realistic Cover Art Archive length, not a toy one.
+    #[test]
+    fn encode_then_decode_is_identity() {
+        for url in [
+            "https://coverartarchive.org/release/aa997ea0-2936-40bd-884d-3af8a0e064dc/12345-500.jpg",
+            "https://archive.org/services/img/gd1977-05-08",
+            "http://example.test/a.png",
+        ] {
+            let cid = compute_url_cid(url).expect("encodes");
+            assert!(cid.starts_with('b'));
+            assert_eq!(decode_url_cid(&cid).as_deref(), Some(url), "round trip: {url}");
+        }
+    }
+
+    #[test]
+    fn a_non_locator_cid_does_not_decode() {
+        // A card locator (0x1007) must not be mistaken for a url locator.
+        let card = crate::hash::compute_card_cid("musicbrainz", "abc").unwrap();
+        assert_eq!(decode_url_cid(&card), None);
     }
 }

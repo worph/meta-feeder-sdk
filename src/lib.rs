@@ -21,6 +21,7 @@
 /// `metacore-app` service the AppStore feeder apps ship on the shared network.
 pub const DEFAULT_META_CORE_URL: &str = "http://metacore-app:9000";
 
+pub mod budget;
 pub mod cache;
 pub mod common;
 pub mod config;
@@ -28,6 +29,7 @@ pub mod enrich;
 pub mod filename_meta;
 pub mod hash;
 pub mod lang;
+pub mod licence;
 pub mod meta_core;
 pub mod plugin;
 pub mod query;
@@ -35,7 +37,9 @@ pub mod query_eval;
 pub mod serve;
 pub mod types;
 
+pub use budget::RateBudget;
 pub use config::{ConfigField, ConfigSchema, FieldKind};
+pub use licence::licence_from_url;
 pub use enrich::{EnrichTarget, EnrichmentConfig, Enricher};
 pub use meta_core::FeederStore;
 pub use plugin::{

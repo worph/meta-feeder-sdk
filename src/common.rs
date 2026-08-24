@@ -286,3 +286,43 @@ mod tests {
         assert!(decode_infohash("").is_none());
     }
 }
+
+/// Percent-encode for a URL **path or query value**, escaping space as `%20`.
+///
+/// ⚠ **Not interchangeable with [`urlencode`]**, which encodes space as `+`.
+/// The `+` form is correct for `application/x-www-form-urlencoded` bodies and
+/// wrong for a Lucene-backed search API — MusicBrainz's `/ws/2` treats `+` as
+/// the "required term" metacharacter, so a `+`-encoded space silently changes
+/// the query's meaning rather than failing loudly. Use this one for anything
+/// going into a query *value*; use `urlencode` for form bodies.
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Normalise a variable-precision date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`) to a
+/// full `YYYY-MM-DD`, or `None` if it is not one.
+///
+/// ⚠ Validate the shape, never infer it from the length: a first cut matched on
+/// `len()` alone, which turned the seven-character string "garbage" into the
+/// `releasedate` "garbage-01" — a malformed value written to the shared hash
+/// where nothing downstream would question it.
+pub fn normalise_date(raw: &str) -> Option<String> {
+    let digits = |s: &str, n: usize| s.len() == n && s.chars().all(|c| c.is_ascii_digit());
+    let parts: Vec<&str> = raw.trim().split('-').collect();
+    match parts.as_slice() {
+        [y] if digits(y, 4) => Some(format!("{y}-01-01")),
+        [y, m] if digits(y, 4) && digits(m, 2) => Some(format!("{y}-{m}-01")),
+        [y, m, d] if digits(y, 4) && digits(m, 2) && digits(d, 2) => Some(format!("{y}-{m}-{d}")),
+        _ => None,
+    }
+}
