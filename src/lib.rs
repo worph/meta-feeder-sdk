@@ -25,6 +25,7 @@ pub mod budget;
 pub mod cache;
 pub mod common;
 pub mod config;
+pub mod domain;
 pub mod enrich;
 pub mod filename_meta;
 pub mod hash;
