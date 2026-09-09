@@ -248,8 +248,12 @@ fn decode_hex_id(id: &str) -> Option<Vec<u8>> {
 ///   merge (a TMDB and a MyAnimeList locator on one meta-core record) safe.
 pub const CARD_LOCATOR_CODEC: u64 = 0x1007;
 
-/// Digest byte ceiling for a card locator, matching meta-share's
-/// `MAX_MULTIHASH_SIZE` — its `CidGeneric<64>` rejects a longer multihash.
+/// Digest byte ceiling for the locators that still carry one — `yt-video`
+/// (via [`kinded_locator_cid`]) and `ext-play`. Matches meta-share's
+/// `MAX_MULTIHASH_SIZE`, whose `CidGeneric<64>` rejects a longer multihash.
+///
+/// ⚠ **[`compute_card_cid`] is deliberately NOT subject to this** — see its
+/// doc. The name is kept because both remaining users were written against it.
 const CARD_LOCATOR_MAX_DIGEST: usize = 64;
 
 /// Encode a self-describing **card locator** CID from a metadata source and
@@ -270,8 +274,28 @@ const CARD_LOCATOR_MAX_DIGEST: usize = 64;
 /// operation driven by an explicit cross-source id mapping — never inferred
 /// here (see `meta-gateway/docs/others/card-tier-search.md` §9).
 ///
-/// Returns `None` when `source` is empty or the digest would overflow the
-/// multihash budget — the caller drops that card.
+/// # No length ceiling, deliberately
+///
+/// A CIDv1 digest length is a varint, so the wire format imposes no limit; the
+/// 64-byte figure elsewhere in this file is Rust's fixed-size `CidGeneric<64>`,
+/// which meta-share needs only because beetswap is
+/// `Behaviour<const MAX_MULTIHASH_SIZE, B>`. A card is never bitswap content
+/// (seeding is gated on sha2-256), so that ceiling does not apply — exactly the
+/// reasoning `METADATA_KEYS.md` §2.1 already records for the `url` locator,
+/// which ships URLs past it today. meta-core's Go `Decode` hand-parses varints
+/// with no cap and reads these correctly.
+///
+/// This is load-bearing for URL-shaped ids: a card keyed on a work's own
+/// address (`("weebcentral.com", "/series/…/some-long-slug")`) runs to ~88
+/// bytes, and capping would silently drop the card rather than mint it.
+///
+/// ⚠ The one consumer that still cares is meta-share's `cid_rank`, which parses
+/// through `MsCid::from_str`. A locator it cannot parse scores `RANK_UNKNOWN`
+/// instead of `RANK_LOCATOR`; harmless for a card (its record carries one CID,
+/// so it wins the canonical election at any rank) but pinned by a golden vector
+/// in `cid-rank-vectors.json` so the two implementations cannot drift unseen.
+///
+/// Returns `None` only when `source` or `id` is empty.
 pub fn compute_card_cid(source: &str, id: &str) -> Option<String> {
     if source.is_empty() || id.is_empty() {
         return None;
@@ -284,9 +308,6 @@ pub fn compute_card_cid(source: &str, id: &str) -> Option<String> {
     write_pb_varint(source_b.len() as u64, &mut digest);
     digest.extend_from_slice(source_b);
     digest.extend_from_slice(id_b);
-    if digest.len() > CARD_LOCATOR_MAX_DIGEST {
-        return None;
-    }
 
     // CIDv1: [version=0x01][codec varint][mh code=0x00 identity][len varint][digest]
     let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
@@ -1067,19 +1088,88 @@ mod tests {
         assert_eq!(&digest[5..], b"tv:95479");
     }
 
-    /// Empty inputs are rejected rather than encoded as an ambiguous locator,
-    /// and an id past the 64-byte multihash budget (meta-share's
-    /// `CidGeneric<64>`) returns `None` so the caller drops the card instead of
-    /// emitting a cid that peer would refuse to parse.
+    /// Empty inputs are rejected rather than encoded as an ambiguous locator.
     #[test]
-    fn card_cid_rejects_empty_and_oversized() {
+    fn card_cid_rejects_empty_halves() {
         assert!(compute_card_cid("", "tv:1").is_none());
         assert!(compute_card_cid("tmdb", "").is_none());
-        let huge = "x".repeat(CARD_LOCATOR_MAX_DIGEST);
-        assert!(compute_card_cid("tmdb", &huge).is_none());
-        // Exactly at the ceiling still encodes.
-        let fits = "x".repeat(CARD_LOCATOR_MAX_DIGEST - 5); // varint(4) + "tmdb"
-        assert!(compute_card_cid("tmdb", &fits).is_some());
+    }
+
+    /// ⚠ A card locator has **no length ceiling**, and this is the test that
+    /// says so on purpose — it used to assert the opposite.
+    ///
+    /// The 64-byte figure is meta-share's `CidGeneric<64>` bitswap alias, and a
+    /// card is never bitswap content. Capping here would silently drop exactly
+    /// the cards a URL-shaped identity exists to mint: a `weebcentral.com` work
+    /// path digests to ~88 bytes. Same reasoning `METADATA_KEYS.md` §2.1
+    /// already records for the `url` locator.
+    #[test]
+    fn card_cid_has_no_length_ceiling() {
+        let long_id = "/series/01J76XYGF1RKSPWA4TQ6GGSVFV/\
+                       Ive-Been-Killing-Slimes-for-300-Years-The-Red-Dragon-Academy-for-Girls";
+        let cid = compute_card_cid("weebcentral.com", long_id).expect("no ceiling");
+        let (source, id) = split_card_digest(&cid);
+        assert!(
+            source.len() + id.len() > CARD_LOCATOR_MAX_DIGEST,
+            "fixture must actually exceed the old cap, got {}",
+            source.len() + id.len()
+        );
+        assert_eq!(source, "weebcentral.com");
+        assert_eq!(id, long_id);
+    }
+
+    /// The host-form identity: the source slot names the site that *owns* the
+    /// work, never the tool that reached it. Pinned as a literal because
+    /// `meta-read`'s `card_cid::encode` carries the mirrored assertion — the two
+    /// addressing one work differently is the failure the whole scheme cannot
+    /// survive.
+    #[test]
+    fn host_form_card_cid_golden_vector() {
+        let cid = compute_card_cid("mangadex.org", "/manga/b0b721ff-c388-4486-aa0f-c2b0bb321512")
+            .expect("card cid");
+        assert_eq!(
+            cid,
+            "bagdsaabybrwwc3thmfsgk6bon5zgol3nmfxgoyjpmiygenzsgftgmlldgm4dqljugq4dmllbmeygmlldgjrdaytcgmzdcnjrgi"
+        );
+    }
+
+    /// `varint(source_len) ‖ source ‖ id` back out of a card locator, so the
+    /// tests above can assert on the halves without a decoder in this crate.
+    fn split_card_digest(cid: &str) -> (String, String) {
+        let raw = base32_lower_decode(&cid[1..]);
+        let mut i = 0usize;
+        let mut rd = || {
+            let (mut n, mut sh) = (0u64, 0u32);
+            loop {
+                let b = raw[i];
+                i += 1;
+                n |= u64::from(b & 0x7f) << sh;
+                if b & 0x80 == 0 {
+                    return n;
+                }
+                sh += 7;
+            }
+        };
+        assert_eq!(rd(), 1, "CIDv1");
+        assert_eq!(rd(), CARD_LOCATOR_CODEC);
+        assert_eq!(rd(), 0, "identity multihash");
+        let len = rd() as usize;
+        let digest = &raw[i..i + len];
+        let mut j = 0usize;
+        let (mut sl, mut sh) = (0usize, 0u32);
+        loop {
+            let b = digest[j];
+            j += 1;
+            sl |= usize::from(b & 0x7f) << sh;
+            if b & 0x80 == 0 {
+                break;
+            }
+            sh += 7;
+        }
+        (
+            String::from_utf8(digest[j..j + sl].to_vec()).unwrap(),
+            String::from_utf8(digest[j + sl..].to_vec()).unwrap(),
+        )
     }
 
     // ---- nzb-posting (0x1003) — the dedup contract -----------------------
