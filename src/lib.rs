@@ -45,10 +45,12 @@ pub use enrich::{EnrichTarget, EnrichmentConfig, Enricher};
 pub use meta_core::FeederStore;
 pub use plugin::{
     upstream_id_field, ConfigError, FeederPlugin, HashKind, HashOutcome, PluginRegistry,
+    RedeemClaim,
 };
 pub use query::{GatewayQuery, GatewaySearchEvent, GatewayWireError, Negation, RangeFilter};
 pub use serve::{
     configure_plugins, router, serve_feeders, ComputeRequest, ComputeResponse, HashKindDto,
     HealthResponse, ManifestResponse, OutcomeDto, PluginManifest, QueryRequest, QueryResponse,
+    RedeemsResponse,
 };
 pub use types::{ByteStream, DiscoveryId, DiscoveryRecord, GatewayError, Hash, PluginHealth};

@@ -10,6 +10,17 @@
 //! - `POST /compute`                   → [`ComputeRequest`] → [`ComputeResponse`]
 //! - `GET  /fetch/{upstream_id}/{record_id}` → streamed bytes (or 404)
 //! - `GET  /blob/{upstream_id}/{cid}`  → bytes (or 404)
+//! - `GET  /redeems`                   → [`RedeemsResponse`] (current redeem claims)
+//!
+//! ## Redeeming a locator
+//!
+//! A plugin that advertises a [`RedeemClaim`] answers `POST /compute` with
+//! `record_id` = a locator cid of that family (a Newznab `nzb-release`, an
+//! OpenSubtitles `provider-file`) by fetching the bytes it names — usually
+//! spending a metered quota — and returning ONE `Sha2_256` outcome carrying
+//! them. `NotFound` means "not mine" (e.g. no key for that indexer host), so the
+//! gateway tries the next claimer. The claims are re-read from `GET /redeems`
+//! so a config change shows up without restarting the gateway.
 //!
 //! ## Bytes & the v1 simplification
 //!
@@ -21,7 +32,7 @@
 //! documented follow-up — those outcomes are metadata-only anyway
 //! (`bytes: None`), so they never ride this path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -41,7 +52,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::config::{self, CONFIG_PAGE_HTML};
-use crate::plugin::{ConfigError, FeederPlugin, HashKind, HashOutcome};
+use crate::plugin::{ConfigError, FeederPlugin, HashKind, HashOutcome, RedeemClaim};
 use crate::query::{GatewayQuery, GatewaySearchEvent, GatewayWireError};
 use crate::types::{DiscoveryRecord, GatewayError, PluginHealth};
 
@@ -94,6 +105,22 @@ pub struct PluginManifest {
     pub id: String,
     pub served_file_types: Vec<String>,
     pub served_content_kinds: Vec<String>,
+    /// [`FeederPlugin::package`] — the `/files/plugin/<package>/` folder redeemed
+    /// bytes are stored under. `null` when the plugin redeems nothing.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// [`FeederPlugin::redeems`] at the time the manifest was served.
+    #[serde(default)]
+    pub redeems: Vec<RedeemClaim>,
+}
+
+/// `GET /redeems` — every hosted plugin's current [`RedeemClaim`]s, keyed by
+/// `upstream_id` (an empty list for a plugin that claims nothing). Polled by
+/// the gateway, so a credential added on the config page is advertised without
+/// a gateway restart.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RedeemsResponse {
+    pub redeems: BTreeMap<String, Vec<RedeemClaim>>,
 }
 
 /// `GET /manifest` — the feeder's hosted plugins + their served types. The
@@ -224,6 +251,17 @@ impl AppState {
 /// status semantics the gateway's `RemoteFeederPlugin` will translate back
 /// into a `GatewayError` on the core side.
 fn gateway_error_response(e: GatewayError) -> Response {
+    // A 429 carries the wait as a `Retry-After` header too, so the gateway can
+    // forward it to the client (a redeem blocked on a spent quota) instead of
+    // parsing the message.
+    if let GatewayError::RateLimited { retry_after_s } = &e {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_s.to_string())],
+            format!("rate limited; retry in {retry_after_s}s"),
+        )
+            .into_response();
+    }
     let (status, msg) = match e {
         GatewayError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
         GatewayError::RateLimited { retry_after_s } => (
@@ -251,12 +289,24 @@ async fn manifest(State(state): State<AppState>) -> Json<ManifestResponse> {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            package: p.package().map(str::to_string),
+            redeems: p.redeems(),
         })
         .collect();
     plugins.sort_by(|a, b| a.id.cmp(&b.id));
     Json(ManifestResponse {
         feeder_version: state.version.clone(),
         plugins,
+    })
+}
+
+async fn redeems(State(state): State<AppState>) -> Json<RedeemsResponse> {
+    Json(RedeemsResponse {
+        redeems: state
+            .plugins
+            .values()
+            .map(|p| (p.upstream_id().to_string(), p.redeems()))
+            .collect(),
     })
 }
 
@@ -492,6 +542,7 @@ pub fn router(
         .route("/compute", post(compute))
         .route("/fetch/:upstream_id/:record_id", get(fetch))
         .route("/blob/:upstream_id/:cid", get(blob))
+        .route("/redeems", get(redeems))
         .route("/config", get(config_page))
         .route("/config/schema", get(config_schema))
         .route("/config/values", get(config_values_get).put(config_values_put))
@@ -541,6 +592,9 @@ struct DegradedPlugin {
     reason: String,
     file_types: &'static [&'static str],
     content_kinds: &'static [&'static str],
+    /// Preserved so the manifest keeps naming the plugin's folder. A degraded
+    /// plugin claims no redeems (it cannot redeem anything).
+    package: Option<&'static str>,
     /// Preserved from the wrapped plugin so a degraded/unconfigured feeder still
     /// serves its config form — otherwise the dashboard shows "no configuration
     /// required" and the operator can never fix the very config that's missing.
@@ -586,6 +640,10 @@ impl FeederPlugin for DegradedPlugin {
         self.content_kinds
     }
 
+    fn package(&self) -> Option<&'static str> {
+        self.package
+    }
+
     fn config_schema(&self) -> crate::config::ConfigSchema {
         self.schema.clone()
     }
@@ -608,6 +666,7 @@ pub fn configure_plugins(
         // borrow across `configure(&mut self)` / the move into `out`.
         let file_types = plugin.served_file_types();
         let content_kinds = plugin.served_content_kinds();
+        let package = plugin.package();
         // Preserve the config surface so a degraded stand-in still serves the
         // real config form (see DegradedPlugin.schema).
         let schema = plugin.config_schema();
@@ -627,6 +686,7 @@ pub fn configure_plugins(
                 reason,
                 file_types,
                 content_kinds,
+                package,
                 schema: schema.clone(),
             })
         };
@@ -758,5 +818,119 @@ mod tests {
         assert!(matches!(events[0], GatewaySearchEvent::Base(_)));
         assert!(matches!(events[1], GatewaySearchEvent::EnrichPatch { .. }));
         assert!(matches!(events[2], GatewaySearchEvent::Done));
+    }
+
+    /// A plugin that redeems `nzb-release` locators for one host.
+    struct StubRedeemer;
+
+    #[async_trait]
+    impl FeederPlugin for StubRedeemer {
+        fn upstream_id(&self) -> &'static str {
+            "redeemer"
+        }
+        fn configure(&mut self, _cache_dir: &FsPath) -> Result<(), ConfigError> {
+            Ok(())
+        }
+        async fn handle_query(
+            &self,
+            _q: &GatewayQuery,
+            _n: usize,
+        ) -> Result<Vec<DiscoveryRecord>, GatewayError> {
+            Ok(vec![])
+        }
+        async fn compute_outcomes(
+            &self,
+            _record_id: &str,
+        ) -> Result<Vec<HashOutcome>, GatewayError> {
+            Ok(vec![])
+        }
+        fn package(&self) -> Option<&'static str> {
+            Some("meta-feeder-stub")
+        }
+        fn redeems(&self) -> Vec<RedeemClaim> {
+            vec![RedeemClaim::nzb_release(vec!["api.example".into()])]
+        }
+    }
+
+    async fn serve_stubs() -> String {
+        let mut plugins: HashMap<String, Arc<dyn FeederPlugin>> = HashMap::new();
+        plugins.insert("redeemer".to_string(), Arc::new(StubRedeemer));
+        plugins.insert("stub".to_string(), Arc::new(StubStreaming));
+        let app = router(plugins, "test".to_string(), std::env::temp_dir());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The manifest carries `package` + `redeems` per plugin; a plugin that
+    /// claims nothing serializes `null` + `[]`.
+    #[tokio::test]
+    async fn manifest_carries_package_and_redeems() {
+        let base = serve_stubs().await;
+        let m: serde_json::Value = reqwest::get(format!("{base}/manifest"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let redeemer = &m["plugins"][0];
+        assert_eq!(redeemer["id"], "redeemer");
+        assert_eq!(redeemer["package"], "meta-feeder-stub");
+        assert_eq!(
+            redeemer["redeems"],
+            serde_json::json!([{
+                "codec": "nzb-release", "field": "manifest",
+                "hosts": ["api.example"], "sources": []
+            }])
+        );
+        let stub = &m["plugins"][1];
+        assert_eq!(stub["package"], serde_json::Value::Null);
+        assert_eq!(stub["redeems"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn redeems_route_keys_claims_by_upstream_id() {
+        let base = serve_stubs().await;
+        let r: RedeemsResponse = reqwest::get(format!("{base}/redeems"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.redeems.get("redeemer"),
+            Some(&vec![RedeemClaim::nzb_release(vec!["api.example".into()])])
+        );
+        assert_eq!(r.redeems.get("stub"), Some(&vec![]));
+    }
+
+    /// The gateway forwards a feeder 429's `Retry-After` — pin that it is set.
+    #[test]
+    fn rate_limited_sets_retry_after() {
+        let resp = gateway_error_response(GatewayError::RateLimited { retry_after_s: 3600 });
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("3600")
+        );
+        // Other errors carry no Retry-After.
+        let resp = gateway_error_response(GatewayError::NotFound);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
+
+    /// A manifest from a pre-1.3 feeder (no `package` / `redeems`) still parses.
+    #[test]
+    fn old_manifest_without_redeem_fields_parses() {
+        let m: PluginManifest = serde_json::from_str(
+            r#"{"id":"x","served_file_types":[],"served_content_kinds":[]}"#,
+        )
+        .unwrap();
+        assert!(m.package.is_none() && m.redeems.is_empty());
     }
 }

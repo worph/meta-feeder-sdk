@@ -17,6 +17,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 
 // Re-exported so plugins can `use meta_feeder_sdk::plugin::GatewayQuery` (the
 // gateway's original `plugin.rs` re-exported it the same way).
@@ -93,6 +94,66 @@ pub enum HashKind {
     CardLocator,
     NzbPosting,
     YtVideo,
+}
+
+/// `RedeemClaim::codec` for a Newznab release locator (`0x1005`).
+pub const REDEEM_CODEC_NZB_RELEASE: &str = "nzb-release";
+/// `RedeemClaim::codec` for a `provider-file` locator (`0x100A`).
+pub const REDEEM_CODEC_PROVIDER_FILE: &str = "provider-file";
+/// `RedeemClaim::field` naming the `.nzb` manifest pointer on a release record.
+pub const POINTER_FIELD_MANIFEST: &str = "manifest";
+/// `RedeemClaim::field` naming the fetched-file pointer on a locator record.
+pub const POINTER_FIELD_FILE: &str = "file";
+
+/// A plugin's claim that it can **redeem** a locator family: turn a locator cid
+/// into the bytes it names, through `POST /compute` with `record_id` = the
+/// locator cid.
+///
+/// Redeeming usually spends a metered upstream quota (a Newznab `t=get` grab,
+/// an OpenSubtitles `/download`), so the gateway routes a redeem only to the
+/// plugins claiming the cid's codec, one at a time, and only on a real play. It
+/// stores the returned bytes and writes their cid onto the locator record under
+/// [`field`](Self::field), so the quota is spent once per file.
+///
+/// Served at `GET /manifest` (per plugin) and `GET /redeems`. Reflects the
+/// plugin's *current* config: a plugin with no credential for a family claims
+/// nothing for it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RedeemClaim {
+    /// Locator family: [`REDEEM_CODEC_NZB_RELEASE`] or [`REDEEM_CODEC_PROVIDER_FILE`].
+    pub codec: String,
+    /// Pointer field the gateway writes the redeemed bytes' cid under:
+    /// [`POINTER_FIELD_MANIFEST`] or [`POINTER_FIELD_FILE`].
+    pub field: String,
+    /// Indexer hosts this plugin holds a key for (`nzb-release`) — bare
+    /// authority, lowercase, never the key itself.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Provider sources this plugin redeems (`provider-file`), e.g. `opensubtitles`.
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+impl RedeemClaim {
+    /// Claim `nzb-release` locators for these indexer hosts.
+    pub fn nzb_release(hosts: Vec<String>) -> Self {
+        Self {
+            codec: REDEEM_CODEC_NZB_RELEASE.to_string(),
+            field: POINTER_FIELD_MANIFEST.to_string(),
+            hosts,
+            sources: Vec::new(),
+        }
+    }
+
+    /// Claim `provider-file` locators for these sources.
+    pub fn provider_file(sources: Vec<String>) -> Self {
+        Self {
+            codec: REDEEM_CODEC_PROVIDER_FILE.to_string(),
+            field: POINTER_FIELD_FILE.to_string(),
+            hosts: Vec::new(),
+            sources,
+        }
+    }
 }
 
 /// Startup-only configuration error returned by [`FeederPlugin::configure`].
@@ -215,6 +276,20 @@ pub trait FeederPlugin: Send + Sync + 'static {
         &[]
     }
 
+    /// Folder under meta-core's `/files/plugin/` where the gateway stores bytes
+    /// this plugin redeems (e.g. `meta-feeder-usenet`). Stable across
+    /// deployments — unlike the feeder's compose service name. Default: none.
+    fn package(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Locator families this plugin can redeem through
+    /// [`compute_outcomes`](FeederPlugin::compute_outcomes) — see
+    /// [`RedeemClaim`]. Computed from the current config. Default: none.
+    fn redeems(&self) -> Vec<RedeemClaim> {
+        Vec::new()
+    }
+
     /// Self-describing config schema. The feeder SDK serves this at
     /// `GET /config/schema` and renders a generic form from it — the gateway and
     /// UI carry no per-plugin field knowledge. Default: no configuration.
@@ -254,5 +329,24 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("scihub"));
         assert!(msg.contains("mirrors"));
+    }
+
+    /// The JSON keys are the gateway/meta-share contract — pin them.
+    #[test]
+    fn redeem_claim_wire_shape() {
+        let claim = RedeemClaim::nzb_release(vec!["api.nzb.life".into()]);
+        assert_eq!(
+            serde_json::to_value(&claim).unwrap(),
+            serde_json::json!({
+                "codec": "nzb-release",
+                "field": "manifest",
+                "hosts": ["api.nzb.life"],
+                "sources": []
+            })
+        );
+        // hosts/sources may be omitted on the wire.
+        let parsed: RedeemClaim =
+            serde_json::from_str(r#"{"codec":"provider-file","field":"file"}"#).unwrap();
+        assert_eq!(parsed, RedeemClaim::provider_file(vec![]));
     }
 }

@@ -17,7 +17,7 @@ bytes; it never joins the swarm.
 
 ```toml
 [dependencies]
-meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v0.1.0" }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.3.0" }
 ```
 
 Not on crates.io yet — the contract is still moving, so consumers pin a tag.
@@ -47,8 +47,32 @@ Four required methods; everything else has a default:
 | `compute_outcomes` | resolve a `record_id` to `HashOutcome`s | `bytes: None` for metadata-only sources |
 
 Defaults you can override: `handle_query_stream`, `handle_fetch`, `health`,
-`served_file_types`, `served_content_kinds`, `config_schema`, `config_values`,
-`get_blob`.
+`served_file_types`, `served_content_kinds`, `package`, `redeems`,
+`config_schema`, `config_values`, `get_blob`.
+
+### Redeeming locators (1.3.0)
+
+A plugin can **redeem** a locator family — turn a locator cid into the bytes it
+names, usually spending a metered quota (a Newznab `.nzb` grab, an OpenSubtitles
+download):
+
+1. Return a `RedeemClaim` from `redeems()` — `RedeemClaim::nzb_release(hosts)` or
+   `RedeemClaim::provider_file(sources)` — reflecting the *current* config (no
+   credential → no claim). Served per plugin in `GET /manifest` and, for polling,
+   at `GET /redeems` → `{"redeems": {"<upstream_id>": [claim…]}}`.
+2. Name a stable `package()` — the `/files/plugin/<package>/` folder the gateway
+   stores the bytes under.
+3. In `compute_outcomes`, accept the locator cid as `record_id` and return ONE
+   `Sha2_256` outcome: `hash = hash::compute_ipfs_cid(&bytes)`, `bytes`,
+   `file_extension`, and optionally a `record` whose fields the gateway merges
+   onto the locator record. Return `NotFound` when the cid is not yours (e.g. no
+   key for that host) so the gateway can try the next claimer; `RateLimited` when
+   the quota is spent.
+
+The gateway calls this only on a real play, one claimer at a time, and writes
+the bytes' cid onto the locator record under the claim's `field` (`manifest` /
+`file`), so each file's quota is spent once. Decode helpers:
+`hash::decode_nzb_release_cid`, `hash::decode_provider_file_cid`, `hash::codec_of`.
 
 ### The routing gate
 
@@ -101,6 +125,9 @@ into the bitswap blockstore.
 The last two carry an identity multihash. Anything that dispatches on the
 multihash instead of the **codec** will silently mis-rank them.
 
+`hash` also encodes/decodes the redeemable locators: `nzb-release` (`0x1005`)
+and `provider-file` (`0x100A`, `(source, id)` — `docs/cid-formats.md` §8).
+
 ## Layout
 
 | module | what |
@@ -121,12 +148,18 @@ multihash instead of the **codec** will silently mis-rank them.
 cargo build && cargo test
 ```
 
-To work on the SDK from inside a feeder checkout without pushing a tag, add a
-gitignored `.cargo/config.toml` in the feeder:
+To test a feeder against an SDK change **before its tag is pushed**: cargo will
+not resolve an unpushed tag, not even under a `[patch]` override ("failed to
+find tag"). Build a scratch copy of the feeder (outside its git tree) with the
+dependency swapped for a path, and run `cargo test` there:
 
-```toml
-paths = ["../meta-feeder-sdk"]
+```bash
+mkdir -p /tmp/feeder && (cd meta-feeder-x && tar cf - --exclude=./target --exclude=./.git .) | (cd /tmp/feeder && tar xf -)
+sed -i 's#meta-feeder-sdk = { git = .*#meta-feeder-sdk = { path = "/abs/path/to/meta-feeder-sdk" }#' /tmp/feeder/feeder-plugin/*/Cargo.toml
+(cd /tmp/feeder && cargo test)
 ```
+
+Never commit the path form: each feeder repo is its own Docker build context.
 
 ## Context
 

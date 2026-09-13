@@ -206,6 +206,76 @@ pub fn compute_nzb_release_cid(api_base: &str, release_id: &str) -> Option<Strin
     Some(format!("b{}", base32_lower_no_padding(&wire)))
 }
 
+/// Decode a self-describing `nzb-release` cid into `(api_base, id)` — the exact
+/// inverse of [`compute_nzb_release_cid`], string-level (no `cid` crate).
+///
+/// `api_base` is scheme-less authority + optional path (`api.nzbgeek.info/api`);
+/// match credentials on its authority (split at the first `/`), grab against
+/// `https://{api_base}`. `id` is lowercase hex, re-encoded from the digest — so
+/// an **odd-length** id comes back left-padded with `0` (the encoder pads it),
+/// which Newznab `t=get` accepts as the same release.
+///
+/// `None` on a wrong codec, a non-identity multihash, or a malformed digest.
+pub fn decode_nzb_release_cid(cid: &str) -> Option<(String, String)> {
+    let digest = identity_locator_digest(cid, NZB_RELEASE_CODEC)?;
+    let mut pos = 0usize;
+    let base_len = read_varint(&digest, &mut pos)? as usize;
+    let rest = digest.get(pos..)?;
+    if rest.len() <= base_len {
+        return None; // need the base AND at least one id byte
+    }
+    let (base, id) = rest.split_at(base_len);
+    let api_base = std::str::from_utf8(base).ok()?.to_string();
+    let id_hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    Some((api_base, id_hex))
+}
+
+/// The multicodec of a base32 (`b…`) CIDv1, or `None` for anything else
+/// (CIDv0 `Qm…`, other multibases, garbage). Dispatch on this — never on the
+/// multihash, which is identity (`0x00`) for every locator family.
+pub fn codec_of(cid: &str) -> Option<u64> {
+    let wire = base32_lower_decode(cid.strip_prefix('b')?)?;
+    let mut pos = 0usize;
+    if read_varint(&wire, &mut pos)? != 1 {
+        return None;
+    }
+    read_varint(&wire, &mut pos)
+}
+
+/// The digest of a well-formed identity-multihash CIDv1 carrying `codec`, or
+/// `None`. Shared by the locator decoders.
+fn identity_locator_digest(cid: &str, codec: u64) -> Option<Vec<u8>> {
+    let wire = base32_lower_decode(cid.strip_prefix('b')?)?;
+    let mut pos = 0usize;
+    if read_varint(&wire, &mut pos)? != 1
+        || read_varint(&wire, &mut pos)? != codec
+        || read_varint(&wire, &mut pos)? != 0x00
+    {
+        return None;
+    }
+    let len = read_varint(&wire, &mut pos)? as usize;
+    let digest = wire.get(pos..)?;
+    (digest.len() == len).then(|| digest.to_vec())
+}
+
+/// Unsigned LEB128 varint at `*pos`, advancing it.
+fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
 /// Hex-decode a Newznab release id. The guid parser only keeps hex runs, so the
 /// id is all-hex by construction; odd-length ids are left-padded with a `0`
 /// nibble. Returns `None` on any non-hex byte (defensive).
@@ -399,8 +469,39 @@ pub fn compute_ext_play_cid(url: &str) -> Option<String> {
     Some(identity_locator_cid(EXT_PLAY_CODEC, digest))
 }
 
+/// Custom multicodec for a fetchable **`provider-file`** locator —
+/// `docs/cid-formats.md` §8. One codec for every provider whose bytes are
+/// fetched the same way; the provider lives inside the digest:
+/// `varint(len(source)) ‖ source ‖ id`. Framing byte-identical to `card`
+/// (`0x1007`) — only the codec differs — but the byte path *redeems* it (through
+/// the claiming feeder's `/compute`) instead of 404ing.
+pub const PROVIDER_FILE_CODEC: u64 = 0x100A;
+
+/// Encode a `provider-file` CID from a registered source token
+/// (`opensubtitles`) and that source's id (`file:7061834`). `None` on an empty
+/// part or a digest past 64 bytes — the caller drops that row rather than emit
+/// an address no peer can parse.
+pub fn compute_provider_file_cid(source: &str, id: &str) -> Option<String> {
+    kinded_locator_cid(PROVIDER_FILE_CODEC, source, id)
+}
+
+/// Inverse of [`compute_provider_file_cid`]: `(source, id)`. Matches the
+/// **codec slot** — a `card` with identical framing does not decode here.
+pub fn decode_provider_file_cid(cid: &str) -> Option<(String, String)> {
+    let digest = identity_locator_digest(cid, PROVIDER_FILE_CODEC)?;
+    let mut pos = 0usize;
+    let source_len = read_varint(&digest, &mut pos)? as usize;
+    let source = digest.get(pos..pos.checked_add(source_len)?)?;
+    let id = digest.get(pos + source_len..)?;
+    Some((
+        String::from_utf8(source.to_vec()).ok()?,
+        String::from_utf8(id.to_vec()).ok()?,
+    ))
+}
+
 /// Shared encoder for the `varint(len(kind)) ‖ kind ‖ id` locator framing used
-/// by [`compute_card_cid`] and [`compute_yt_video_cid`].
+/// by [`compute_card_cid`], [`compute_yt_video_cid`] and
+/// [`compute_provider_file_cid`].
 fn kinded_locator_cid(codec: u64, kind: &str, id: &str) -> Option<String> {
     if kind.is_empty() || id.is_empty() {
         return None;
@@ -1387,5 +1488,86 @@ mod roundtrip_tests {
         // A card locator (0x1007) must not be mistaken for a url locator.
         let card = crate::hash::compute_card_cid("musicbrainz", "abc").unwrap();
         assert_eq!(decode_url_cid(&card), None);
+    }
+}
+
+#[cfg(test)]
+mod redeem_locator_tests {
+    use super::*;
+
+    /// `docs/cid-formats.md` §8.2 golden vector — moved here from
+    /// meta-feeder-opensubtitles' local `locator.rs`; the vector proves the
+    /// move changed no bytes.
+    #[test]
+    fn provider_file_matches_the_documented_vector() {
+        assert_eq!(
+            compute_provider_file_cid("opensubtitles", "file:7061834").as_deref(),
+            Some("bagfcaaa2bvxxazloon2we5djorwgk43gnfwgkorxga3dcobtgq")
+        );
+    }
+
+    #[test]
+    fn provider_file_round_trips_and_refuses_other_codecs() {
+        let cid = compute_provider_file_cid("opensubtitles", "file:12658754").unwrap();
+        assert_eq!(
+            decode_provider_file_cid(&cid),
+            Some(("opensubtitles".to_string(), "file:12658754".to_string()))
+        );
+        // Identical framing, different codec: a card must not decode as a file.
+        let card = compute_card_cid("tmdb", "tv:95479").unwrap();
+        assert_eq!(card, "bagdsaaanar2g2zdcor3duojvgq3ts");
+        assert_eq!(decode_provider_file_cid(&card), None);
+        assert_eq!(decode_provider_file_cid("not-a-cid"), None);
+        assert_eq!(decode_provider_file_cid(""), None);
+    }
+
+    #[test]
+    fn provider_file_digest_ceiling_is_64_bytes() {
+        // varint(13) + "opensubtitles" = 14 bytes, so the id may use 50.
+        assert!(compute_provider_file_cid("opensubtitles", &"x".repeat(50)).is_some());
+        assert!(compute_provider_file_cid("opensubtitles", &"x".repeat(51)).is_none());
+    }
+
+    #[test]
+    fn nzb_release_round_trips() {
+        let cid = compute_nzb_release_cid("api.nzbgeek.info/api", "0123abcdef").unwrap();
+        assert_eq!(
+            decode_nzb_release_cid(&cid),
+            Some(("api.nzbgeek.info/api".to_string(), "0123abcdef".to_string()))
+        );
+        // A host:port authority survives too.
+        let cid = compute_nzb_release_cid("127.0.0.1:8080", "ff00").unwrap();
+        assert_eq!(
+            decode_nzb_release_cid(&cid),
+            Some(("127.0.0.1:8080".to_string(), "ff00".to_string()))
+        );
+    }
+
+    /// The encoder left-pads an odd-length id, so the decode is the padded form.
+    #[test]
+    fn nzb_release_odd_length_id_comes_back_padded() {
+        let cid = compute_nzb_release_cid("api.nzb.life", "abc").unwrap();
+        assert_eq!(
+            decode_nzb_release_cid(&cid),
+            Some(("api.nzb.life".to_string(), "0abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn nzb_release_refuses_other_codecs() {
+        let card = compute_card_cid("tmdb", "tv:95479").unwrap();
+        assert_eq!(decode_nzb_release_cid(&card), None);
+        assert_eq!(decode_nzb_release_cid("bafkreigarbage"), None);
+    }
+
+    #[test]
+    fn codec_of_reads_the_codec_slot() {
+        let nzb = compute_nzb_release_cid("api.nzb.life", "ab").unwrap();
+        assert_eq!(codec_of(&nzb), Some(NZB_RELEASE_CODEC));
+        let file = compute_provider_file_cid("opensubtitles", "file:1").unwrap();
+        assert_eq!(codec_of(&file), Some(PROVIDER_FILE_CODEC));
+        assert_eq!(codec_of(&compute_ipfs_cid(b"hello")), Some(0x55));
+        assert_eq!(codec_of("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"), None);
+        assert_eq!(codec_of(""), None);
     }
 }
