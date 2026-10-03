@@ -8,6 +8,10 @@
 //! hashing-into-the-blockstore, and the meta-core store-back to itself.
 //!
 //! Deliberately libp2p-free and blockstore-free — see this crate's `Cargo.toml`.
+//!
+//! With the `transport` feature it also carries the **transport-plugin**
+//! contract ([`transport`]): the same split, applied to meta-share — a
+//! protocol-agnostic hull and one sidecar per byte-moving protocol.
 
 // `redb::Error` is a large enum; the cache wrappers (`cache.rs`) return it
 // directly rather than boxing on every embedded-DB call. Boxing each would be
@@ -36,6 +40,8 @@ pub mod plugin;
 pub mod query;
 pub mod query_eval;
 pub mod serve;
+#[cfg(feature = "transport")]
+pub mod transport;
 pub mod types;
 
 pub use budget::RateBudget;
