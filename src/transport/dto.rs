@@ -82,6 +82,11 @@ pub struct Manifest {
     pub version: String,
     pub contract: u32,
     pub capabilities: Capabilities,
+    /// Serves a config plane (`/config`, `/config/schema`, `/config/values`).
+    /// Set by the harness from [`TransportPlugin::config`](super::plugin::TransportPlugin::config);
+    /// absent in older manifests.
+    #[serde(default)]
+    pub config: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>feeder config</title>
+<title>plugin config</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -47,7 +47,7 @@
 </head>
 <body>
   <h1 id="title">Plugin configuration</h1>
-  <p class="sub">Secrets are write-only — set values are shown as “set”, never echoed back. Saving requires a feeder restart to take effect. Fields marked <span class="req">*</span> are required.</p>
+  <p class="sub">Secrets are write-only — set values are shown as “set”, never echoed back. Saving restarts the plugin to apply. Fields marked <span class="req">*</span> are required.</p>
   <div id="banner" class="banner"></div>
   <form id="form"></form>
   <div class="bar" id="bar" style="display:none">
@@ -220,14 +220,14 @@ async function save() {
     });
     if (!res.ok) {
       const detail = (await res.text().catch(() => "")).trim();
-      throw new Error(detail ? `the feeder rejected it (HTTP ${res.status}): ${detail}`
-                             : `the feeder returned HTTP ${res.status}`);
+      throw new Error(detail ? `the plugin rejected it (HTTP ${res.status}): ${detail}`
+                             : `the plugin returned HTTP ${res.status}`);
     }
     const j = await res.json().catch(() => ({}));
     if (j.reloading) {
       // The feeder is restarting itself (~2-3s) to apply the change. Poll it
       // back up, then refresh the form so secret pills reflect stored state.
-      banner("warn", "Saved — reloading the feeder to apply (~3 s)…");
+      banner("warn", "Saved — reloading the plugin to apply (~3 s)…");
       let tries = 6;
       const poll = async () => {
         try { await load(); banner("ok", "Reloaded — new config applied."); }
@@ -235,7 +235,7 @@ async function save() {
       };
       setTimeout(poll, 3000);
     } else {
-      if (j.restart_required) banner("warn", "Saved. Restart the feeder container for changes to take effect.");
+      if (j.restart_required) banner("warn", "Saved. Restart the plugin container for changes to take effect.");
       else banner("ok", "Saved.");
       // Re-fetch so secret pills reflect the new stored state.
       await load();
@@ -243,7 +243,7 @@ async function save() {
   } catch (e) {
     const msg = (e && e.message) ? e.message : String(e);
     const friendly = /Failed to fetch|NetworkError|load failed/i.test(msg)
-      ? "couldn't reach the feeder — it may be restarting; wait a moment and try again."
+      ? "couldn't reach the plugin — it may be restarting; wait a moment and try again."
       : msg;
     banner("err", "Could not save: " + friendly);
   } finally {

@@ -11,7 +11,9 @@
 //! - `PUT    /focus`           ← [`FocusSnapshot`](super::focus::FocusSnapshot), `204`
 //! - `GET    /focus`           → the snapshot the plugin currently obeys
 //!
-//! plus whatever [`TransportPlugin::extra_routes`] adds.
+//! plus the `/config*` routes when [`TransportPlugin::config`] is `Some` (see
+//! [`ConfigPlane`](super::config::ConfigPlane)), plus whatever
+//! [`TransportPlugin::extra_routes`] adds.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,8 +34,9 @@ type Shared = Arc<dyn TransportPlugin>;
 /// The common router for `plugin`, merged with its extra routes.
 pub fn router<P: TransportPlugin>(plugin: Arc<P>) -> Router {
     let extra = Arc::clone(&plugin).extra_routes();
+    let config = plugin.config().map(|c| c.routes());
     let shared: Shared = plugin;
-    Router::new()
+    let r = Router::new()
         .route("/manifest", get(manifest))
         .route("/health", get(health))
         .route("/raw/:cid", get(raw))
@@ -42,7 +45,11 @@ pub fn router<P: TransportPlugin>(plugin: Arc<P>) -> Router {
         .route("/reconcile", post(reconcile))
         .route("/focus", get(get_focus).put(put_focus))
         .with_state(shared)
-        .merge(extra)
+        .merge(extra);
+    match config {
+        Some(c) => r.merge(c),
+        None => r,
+    }
 }
 
 /// Bind `listen` and serve `plugin` until SIGTERM / Ctrl-C.
@@ -82,7 +89,9 @@ pub async fn shutdown_signal() {
 }
 
 async fn manifest(State(p): State<Shared>) -> Response {
-    Json(p.manifest()).into_response()
+    let mut m = p.manifest();
+    m.config = p.config().is_some();
+    Json(m).into_response()
 }
 
 async fn health(State(p): State<Shared>) -> Response {

@@ -17,6 +17,13 @@
 //!   [`HDR_MANIFEST_CID`]. `404` = not a Usenet cid; any other error carries
 //!   `{"error"}` — the manifest could not be redeemed or fetched. Parsing and
 //!   the `nzb-posting` digest check stay in the plugin.
+//! - `GET  /internal/network` → [`NetworkInfo`]: the hull's own endpoints a
+//!   plugin needs to know (the ipfs plugin announces `peer_url` in identify).
+//! - `GET  /internal/legacy/usenet` → the NNTP block meta-share's `settings.json`
+//!   held before the nzb plugin owned its settings (`404` = none). One-shot
+//!   migration source for the nzb plugin's config plane.
+//! - `GET  /health` → `200` once the hull has finished its boot steps (the
+//!   ipfs plugin waits on it before opening `ipfs/blocks.redb`).
 //!
 //! Why callbacks and not plugin-side logic: these need what only the hull has —
 //! the record cache and meta-core, the gateway redeem, the IPFS tier. Plugins
@@ -59,6 +66,17 @@ pub struct RecordInfo {
     /// The record's display title.
     #[serde(default)]
     pub title: Option<String>,
+}
+
+/// The hull's endpoints (`GET /internal/network`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkInfo {
+    /// meta-core base URL the hull talks to.
+    #[serde(default)]
+    pub meta_core_url: Option<String>,
+    /// The URL other peers reach this meta-share at (announced in identify).
+    #[serde(default)]
+    pub peer_url: Option<String>,
 }
 
 /// Plugin-side client for the hull's internal API. A client with no base URL
@@ -189,6 +207,37 @@ impl HullClient {
     /// the hull has no record.
     pub async fn record(&self, cid: &str) -> Result<Option<RecordInfo>, String> {
         self.get_json(&format!("/internal/records/{cid}"), Duration::from_secs(15)).await
+    }
+
+    /// The hull's endpoints.
+    pub async fn network(&self) -> Result<Option<NetworkInfo>, String> {
+        self.get_json("/internal/network", Duration::from_secs(5)).await
+    }
+
+    /// The NNTP block meta-share's own settings held before the nzb plugin had
+    /// a config plane; `Ok(None)` = there is none.
+    pub async fn legacy_usenet(&self) -> Result<Option<super::nzb::UsenetSettings>, String> {
+        self.get_json("/internal/legacy/usenet", Duration::from_secs(5)).await
+    }
+
+    /// Wait until the hull's internal listener answers `GET /health` with 2xx,
+    /// or `max` elapses. Returns whether it came up.
+    pub async fn wait_ready(&self, max: Duration) -> bool {
+        let Ok(url) = self.url("/health") else {
+            return false;
+        };
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            if let Ok(r) = self.http.get(&url).timeout(Duration::from_secs(3)).send().await {
+                if r.status().is_success() {
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     /// [`RecordInfo`] from the hull's record cache only.

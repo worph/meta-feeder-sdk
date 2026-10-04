@@ -7,6 +7,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::Router;
 
+use super::config::ConfigPlane;
 use super::dto::{Deleted, Health, Job, Manifest, ReconcileReport, ReconcileRequest};
 use super::error::ApiError;
 use super::focus::FocusView;
@@ -41,6 +42,13 @@ pub trait TransportPlugin: Send + Sync + 'static {
 
     /// The view `PUT /focus` writes into.
     fn focus(&self) -> &Arc<FocusView>;
+
+    /// The plugin's own settings, if it has any. `Some` mounts the `/config*`
+    /// routes and sets `manifest.config` — the hull's dashboard then offers a
+    /// "configure" panel that embeds `/config` through its proxy.
+    fn config(&self) -> Option<Arc<ConfigPlane>> {
+        None
+    }
 
     /// Protocol-specific routes, merged into the common router. Paths must not
     /// collide with the common ones.

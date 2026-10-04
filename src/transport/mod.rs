@@ -12,6 +12,8 @@
 //! - [`plugin::TransportPlugin`] + [`serve::serve_transport`]: the plugin side.
 //! - [`client::RemoteTransport`]: the hull side.
 //! - [`hull::HullClient`]: plugin → hull callbacks (internal port only).
+//! - [`config::ConfigPlane`]: the plugin's own settings + the config page the
+//!   hull's dashboard embeds.
 //! - [`focus::FocusView`]: the plugin's replica of the hull's playback focus.
 //! - [`dto`]: common wire types; [`error::ApiError`] / [`range`]: shared so a
 //!   relayed plugin response is byte-identical to what the monolith answered.
@@ -29,6 +31,7 @@
 
 pub mod cid;
 pub mod client;
+pub mod config;
 pub mod dto;
 pub mod error;
 pub mod file;
@@ -46,12 +49,13 @@ pub mod torrent;
 pub mod testkit;
 
 pub use client::RemoteTransport;
+pub use config::ConfigPlane;
 pub use dto::{
     Capabilities, Deleted, Event, Health, Job, Jobs, Manifest, PromotedFile, ReconcileReport,
     ReconcileRequest, CONTRACT_VERSION,
 };
 pub use error::ApiError;
 pub use focus::{FocusSnapshot, FocusTitle, FocusView, Lane};
-pub use hull::{HullClient, RecordInfo};
+pub use hull::{HullClient, NetworkInfo, RecordInfo};
 pub use plugin::TransportPlugin;
 pub use serve::serve_transport;

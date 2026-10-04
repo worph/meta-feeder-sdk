@@ -39,8 +39,10 @@ pub async fn conformance(base: &str) -> Result<(), Vec<String>> {
         .with_control_timeout(Duration::from_secs(10));
     let mut fails = Vec::new();
 
+    let mut has_config = false;
     match t.manifest().await {
         Ok(m) => {
+            has_config = m.config;
             if m.id.is_empty() {
                 fails.push("manifest.id is empty".into());
             }
@@ -110,6 +112,31 @@ pub async fn conformance(base: &str) -> Result<(), Vec<String>> {
         Err(e) => fails.push(format!("GET /raw/not-a-cid: {e}")),
     }
 
+    if has_config {
+        match http.get(t.url("/config/schema")).send().await {
+            Ok(r) if r.status().is_success() => {
+                if r.json::<crate::config::ConfigSchema>().await.is_err() {
+                    fails.push("GET /config/schema body is not a ConfigSchema".into());
+                }
+            }
+            Ok(r) => fails.push(format!("GET /config/schema: status {}", r.status())),
+            Err(e) => fails.push(format!("GET /config/schema: {e}")),
+        }
+        match http.get(t.url("/config/values")).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) if v.is_object() => {}
+                _ => fails.push("GET /config/values is not a JSON object".into()),
+            },
+            Ok(r) => fails.push(format!("GET /config/values: status {}", r.status())),
+            Err(e) => fails.push(format!("GET /config/values: {e}")),
+        }
+        match http.get(t.url("/config")).send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => fails.push(format!("GET /config: status {}", r.status())),
+            Err(e) => fails.push(format!("GET /config: {e}")),
+        }
+    }
+
     if fails.is_empty() {
         Ok(())
     } else {
@@ -130,6 +157,7 @@ mod tests {
     /// The smallest plugin that should pass: holds nothing, fetches nothing.
     struct Empty {
         focus: Arc<FocusView>,
+        config: Option<Arc<crate::transport::config::ConfigPlane>>,
     }
 
     #[async_trait]
@@ -141,6 +169,7 @@ mod tests {
                 version: "0".into(),
                 contract: CONTRACT_VERSION,
                 capabilities: Capabilities { fetch: true, share: false },
+                config: false,
             }
         }
         async fn raw(&self, _cid: String, _h: HeaderMap) -> Response {
@@ -158,11 +187,32 @@ mod tests {
         fn focus(&self) -> &Arc<FocusView> {
             &self.focus
         }
+        fn config(&self) -> Option<Arc<crate::transport::config::ConfigPlane>> {
+            self.config.clone()
+        }
     }
 
     #[tokio::test]
     async fn the_empty_plugin_conforms() {
-        let addr = spawn_local(Arc::new(Empty { focus: FocusView::new() })).await;
+        let addr = spawn_local(Arc::new(Empty { focus: FocusView::new(), config: None })).await;
         conformance(&format!("http://{addr}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_plugin_with_a_config_plane_conforms_and_says_so() {
+        use crate::config::{ConfigField, ConfigSchema};
+        use crate::transport::config::ConfigPlane;
+        let dir = tempfile::tempdir().unwrap();
+        let plane = ConfigPlane::new(
+            ConfigSchema { fields: vec![ConfigField::secret("key", "Key")] },
+            dir.path(),
+            serde_json::json!({}),
+        )
+        .without_restart();
+        let addr = spawn_local(Arc::new(Empty { focus: FocusView::new(), config: Some(Arc::new(plane)) })).await;
+        let base = format!("http://{addr}");
+        conformance(&base).await.unwrap();
+        let m: Manifest = reqwest::get(format!("{base}/manifest")).await.unwrap().json().await.unwrap();
+        assert!(m.config, "the harness must advertise the config plane");
     }
 }
