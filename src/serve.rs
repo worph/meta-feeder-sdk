@@ -278,8 +278,15 @@ fn gateway_error_response(e: GatewayError) -> Response {
 // -------- handlers ---------------------------------------------------------
 
 async fn manifest(State(state): State<AppState>) -> Json<ManifestResponse> {
-    let mut plugins: Vec<PluginManifest> = state
-        .plugins
+    Json(build_manifest(&state.plugins, &state.version))
+}
+
+/// The `/manifest` body — also what the beacon advertise's `rev` is a hash of.
+fn build_manifest(
+    plugins: &HashMap<String, Arc<dyn FeederPlugin>>,
+    version: &str,
+) -> ManifestResponse {
+    let mut plugins: Vec<PluginManifest> = plugins
         .values()
         .map(|p| PluginManifest {
             id: p.upstream_id().to_string(),
@@ -294,10 +301,27 @@ async fn manifest(State(state): State<AppState>) -> Json<ManifestResponse> {
         })
         .collect();
     plugins.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(ManifestResponse {
-        feeder_version: state.version.clone(),
+    ManifestResponse {
+        feeder_version: version.to_string(),
         plugins,
-    })
+    }
+}
+
+/// The feeder's beacon v2 resource: one `metamesh.feeder/<upstream_id>` cap per
+/// hosted plugin, the manifest endpoint, and `rev` = hash of the manifest.
+fn beacon_resource(
+    plugins: &HashMap<String, Arc<dyn FeederPlugin>>,
+    version: &str,
+    listen_port: u16,
+) -> crate::beacon::Resource {
+    use crate::beacon::{advertise_url, binds_from_env, caps, rev_of, Resource};
+    let m = build_manifest(plugins, version);
+    let mut r = Resource::new("feeder", m.plugins.iter().map(|p| caps::feeder(&p.id)))
+        .with_endpoint("http", advertise_url(listen_port))
+        .with_endpoint("manifest", "/manifest");
+    r.rev = Some(rev_of(&m));
+    r.binds = binds_from_env();
+    r
 }
 
 async fn redeems(State(state): State<AppState>) -> Json<RedeemsResponse> {
@@ -568,7 +592,8 @@ pub async fn serve_feeders(
     let state_dir = state_dir.into();
     let configured = configure_plugins(plugins, &state_dir)?;
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let app = router(configured, version, state_dir.clone());
+    let advertised = configured.clone();
+    let app = router(configured, version.clone(), state_dir.clone());
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(
@@ -576,6 +601,18 @@ pub async fn serve_feeders(
         %listen,
         "feeder listening"
     );
+    // Beacon v2: advertise once the port is bound, so a consumer that hears us
+    // can connect. The node lives for the process.
+    let port = listen.port();
+    let name = std::env::var("SERVICE_NAME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        let mut ids: Vec<&String> = advertised.keys().collect();
+        ids.sort();
+        ids.first().map_or_else(|| "meta-feeder".to_string(), |id| format!("meta-feeder-{id}"))
+    });
+    let beacon_version = version.clone();
+    let _beacon = crate::beacon::advertise_plugin(&name, &version, move || {
+        beacon_resource(&advertised, &beacon_version, port)
+    });
     axum::serve(listener, app)
         .await
         .map_err(anyhow::Error::from)

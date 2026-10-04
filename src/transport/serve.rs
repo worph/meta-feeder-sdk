@@ -57,14 +57,39 @@ pub async fn serve_transport<P: TransportPlugin>(
     plugin: Arc<P>,
     listen: SocketAddr,
 ) -> anyhow::Result<()> {
-    let id = plugin.manifest().id;
+    let manifest = plugin.manifest();
+    let id = manifest.id.clone();
+    let advertised = Arc::clone(&plugin);
     let app = router(plugin);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(%listen, plugin = %id, "transport plugin listening");
+    // Beacon v2: advertise once bound; say `bye` on clean shutdown so the hull
+    // drops us at once instead of after the liveness window.
+    let port = listen.port();
+    let beacon = crate::beacon::advertise_plugin(&manifest.implementation, &manifest.version, move || {
+        beacon_resource(advertised.as_ref(), port)
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if let Some(b) = beacon {
+        b.bye().await;
+    }
     Ok(())
+}
+
+/// The transport's beacon v2 resource: id = manifest id, cap
+/// `metamesh.transport/<id>@<contract>`, `rev` = hash of the served manifest.
+fn beacon_resource<P: TransportPlugin + ?Sized>(plugin: &P, listen_port: u16) -> crate::beacon::Resource {
+    use crate::beacon::{advertise_url, binds_from_env, caps, rev_of, Resource};
+    let mut m = plugin.manifest();
+    m.config = plugin.config().is_some();
+    let mut r = Resource::new(m.id.clone(), [caps::transport(&m.id, m.contract)])
+        .with_endpoint("http", advertise_url(listen_port))
+        .with_endpoint("manifest", "/manifest");
+    r.rev = Some(rev_of(&m));
+    r.binds = binds_from_env();
+    r
 }
 
 /// Resolves on SIGTERM (docker stop) or Ctrl-C.

@@ -35,6 +35,34 @@ async fn main() -> anyhow::Result<()> {
 A **service is a `Vec`** — grouping plugins into one binary is a deployment
 choice, not an architectural one.
 
+### Discovery (1.6.0)
+
+`serve_feeders` and `serve_transport` advertise the process over **beacon v2**
+(UDP multicast `239.255.99.1:9099`, spec: meta-root
+`docs/project-architecture/beacon-v2.md`) as soon as the port is bound — a
+feeder as `metamesh.feeder/<upstream_id>` (one cap per hosted plugin), a
+transport as `metamesh.transport/<id>@<contract>` — with `endpoints.http`,
+`endpoints.manifest = /manifest` and `rev` = a hash of the served manifest
+(re-advertised when it changes). Nothing to call. Env:
+
+| Env | Default | |
+|---|---|---|
+| `ENABLE_UDP_DISCOVERY` | `true` | `false` turns advertising off |
+| `BEACON_ADVERTISE_URL` | `http://$HOSTNAME:<port>` | `endpoints.http` |
+| `BEACON_BINDS` | unset | the one consumer instance allowed to list this plugin |
+| `BEACON_GROUP` / `BEACON_PORT` / `BEACON_INTERVAL_MS` | `239.255.99.1` / `9099` / `10000` | |
+
+The `beacon` module is also usable on its own — the meta-* services depend on
+the SDK for nothing else:
+
+```toml
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.6.0", default-features = false, features = ["beacon"] }
+```
+
+Features: `feeder` (default — the whole feeder harness; implies `beacon`),
+`beacon` (tokio/serde/tracing/libc only), `transport` (implies `feeder`),
+`testkit`.
+
 ## Writing a plugin
 
 Four required methods; everything else has a default:
@@ -141,6 +169,7 @@ and `provider-file` (`0x100A`, `(source, id)` — `docs/cid-formats.md` §8).
 | `hash` | the content-addressing families above |
 | `filename_meta` / `lang` | release-tag parsing helpers |
 | `enrich`, `meta_core`, `common` | MetaMesh-internal; not part of the plugin contract |
+| `beacon` | beacon v2 local discovery: `BeaconNode`, `Resource`, `cap_matches`, the MetaMesh `caps` vocabulary |
 
 ## Development
 

@@ -1,6 +1,6 @@
 [package]
 name = "meta-feeder-sdk"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -32,44 +32,59 @@ publish = false
 # of here so feeders that don't need them don't pay for them.
 
 [features]
+default = ["feeder"]
+# Everything a feeder sidecar (and the transport contract) builds on: the
+# FeederPlugin trait, hashing, the redb cache, the axum harness. On by default
+# so existing consumers build exactly what they always did.
+feeder = [
+    "beacon",
+    "dep:axum", "dep:hyper", "dep:reqwest", "dep:base64", "dep:futures",
+    "dep:async-trait", "dep:anyhow", "dep:thiserror", "dep:sha2", "dep:bytes",
+    "dep:regex", "dep:redb",
+]
+# Beacon v2 local discovery (`src/beacon/`). Needs only tokio/serde/tracing/libc,
+# so a meta-* service takes the SDK with `default-features = false,
+# features = ["beacon"]` and pulls in none of the feeder machinery.
+beacon = ["dep:libc"]
 # The meta-share transport-plugin contract (`src/transport/`): the hull's
 # client, the plugins' axum harness, the focus replica, shared error/range
 # types. Off by default so feeders build exactly what they always did.
-transport = ["dep:cid", "dep:libc", "dep:tokio-util"]
+transport = ["feeder", "dep:cid", "dep:tokio-util"]
 # Conformance checks any transport implementation must pass.
 testkit = ["transport"]
 
 [dependencies]
 # Async runtime + HTTP server (the serve_feeders harness)
 tokio = { version = "1.40", features = ["full"] }
-axum = { version = "0.7", features = ["json"] }
-hyper = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+axum = { version = "0.7", features = ["json"], optional = true }
+hyper = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false, optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
 
 # Utilities
-futures = "0.3"
-async-trait = "0.1"
-anyhow = "1"
-thiserror = "1"
+futures = { version = "0.3", optional = true }
+async-trait = { version = "0.1", optional = true }
+anyhow = { version = "1", optional = true }
+thiserror = { version = "1", optional = true }
 tracing = "0.1"
-sha2 = "0.10"
-bytes = "1"
+sha2 = { version = "0.10", optional = true }
+bytes = { version = "1", optional = true }
 # Title-tag parsing (shared filename_meta — season/episode/quality/codec/languages).
-regex = "1"
+regex = { version = "1", optional = true }
 
 # Per-plugin midhash/blob cache. Schema is identical to meta-share v1 — see
 # cache.rs. Pure-Rust single-process embedded store.
-redb = "2"
+redb = { version = "2", optional = true }
 
 # CID parsing for the transport contract only (`transport::cid`). Optional so
 # feeders don't pull it.
 cid = { version = "0.11", optional = true }
-# statvfs(2) for `transport::fsutil::available_bytes`.
+# Raw sockets for `beacon` (per-interface multicast) and statvfs(2) for
+# `transport::fsutil::available_bytes`.
 libc = { version = "0.2", optional = true }
 # `ReaderStream` for `transport::file`.
 tokio-util = { version = "0.7", features = ["io"], optional = true }
