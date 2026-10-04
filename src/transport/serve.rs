@@ -66,7 +66,13 @@ pub async fn serve_transport<P: TransportPlugin>(
     // Beacon v2: advertise once bound; say `bye` on clean shutdown so the hull
     // drops us at once instead of after the liveness window.
     let port = listen.port();
-    let beacon = crate::beacon::advertise_plugin(&manifest.implementation, &manifest.version, move || {
+    // `node.name` is a short machine name; the human description stays in the
+    // manifest (`implementation`), which a consumer fetches over HTTP.
+    let beacon_name = std::env::var("SERVICE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("meta-transport-{}", manifest.id));
+    let beacon = crate::beacon::advertise_plugin(&beacon_name, &manifest.version, move || {
         beacon_resource(advertised.as_ref(), port)
     });
     axum::serve(listener, app)

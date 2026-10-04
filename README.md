@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 A **service is a `Vec`** — grouping plugins into one binary is a deployment
 choice, not an architectural one.
 
-### Discovery (1.6.0)
+### Discovery (1.6.0, scan 1.7.0)
 
 `serve_feeders` and `serve_transport` advertise the process over **beacon v2**
 (UDP multicast `239.255.99.1:9099`, spec: meta-root
@@ -52,11 +52,19 @@ transport as `metamesh.transport/<id>@<contract>` — with `endpoints.http`,
 | `BEACON_BINDS` | unset | the one consumer instance allowed to list this plugin |
 | `BEACON_GROUP` / `BEACON_PORT` / `BEACON_INTERVAL_MS` | `239.255.99.1` / `9099` / `10000` | |
 
+`beacon::scan(node, pattern, configured, wait)` (1.7.0) is what a consumer's
+**Scan** button runs: probe everyone, wait, then classify every resource
+matching `pattern` as `configured` / `addable` / `bound-elsewhere` against the
+consumer's `(name, url)` list — the `ScanReport` JSON the shared
+`<meta-beacon-scan>` element renders. Transports advertise as
+`meta-transport-<id>` (`SERVICE_NAME` overrides), feeders as
+`meta-feeder-<first upstream>`.
+
 The `beacon` module is also usable on its own — the meta-* services depend on
 the SDK for nothing else:
 
 ```toml
-meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.6.0", default-features = false, features = ["beacon"] }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.7.0", default-features = false, features = ["beacon"] }
 ```
 
 Features: `feeder` (default — the whole feeder harness; implies `beacon`),

@@ -15,8 +15,10 @@
 
 mod node;
 mod proto;
+mod scan;
 
 pub use node::{enabled_from_env, hostname, BeaconNode, Config, SeenNode, SeenResource};
+pub use scan::{classify, scan, suggested_name, Candidate, CandidateState, ScanReport, ScanSummary};
 pub use proto::{
     cap_matches, rev_of, Message, NodeInfo, Resource, DEFAULT_GROUP, DEFAULT_INTERVAL, DEFAULT_PORT,
     LIVENESS_FACTOR, MAX_DATAGRAM, PROTO, VERSION,
@@ -38,6 +40,10 @@ pub mod caps {
     pub const FEEDER_PREFIX: &str = "metamesh.feeder/";
     /// Every feeder upstream.
     pub const ANY_FEEDER: &str = "metamesh.feeder/*";
+    /// Prefix of `metamesh.enrich/<plugin_id>` (meta-sort enrichment plugins).
+    pub const ENRICH_PREFIX: &str = "metamesh.enrich/";
+    /// Every meta-sort enrichment plugin.
+    pub const ANY_ENRICH: &str = "metamesh.enrich/*";
 
     pub fn service(name: &str) -> String {
         format!("{SERVICE_PREFIX}{name}")
@@ -49,6 +55,10 @@ pub mod caps {
 
     pub fn feeder(upstream_id: &str) -> String {
         format!("{FEEDER_PREFIX}{upstream_id}")
+    }
+
+    pub fn enrich(plugin_id: &str) -> String {
+        format!("{ENRICH_PREFIX}{plugin_id}")
     }
 }
 
