@@ -156,6 +156,25 @@ impl RemoteTransport {
         }
     }
 
+    /// `PUT /manifests/:cid`: hand a manifest-consuming plugin (contract 2) the
+    /// manifest a pointer resolved to, after it answered `428` +
+    /// [`super::dto::HDR_NEEDS_MANIFEST`].
+    pub async fn push_manifest(&self, cid: &str, manifest: bytes::Bytes) -> Result<(), ApiError> {
+        let r = self
+            .http
+            .put(self.url(&format!("/manifests/{cid}")))
+            .body(manifest)
+            .timeout(self.control_timeout)
+            .send()
+            .await
+            .map_err(|e| self.unreachable(e))?;
+        if r.status().is_success() {
+            Ok(())
+        } else {
+            Err(error_from(r).await)
+        }
+    }
+
     // ---- typed helpers for extra routes ------------------------------------
 
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {

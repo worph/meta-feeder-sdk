@@ -9,8 +9,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Bumped on any breaking change to the common routes below. The hull refuses
-/// a plugin whose `/manifest` reports a different major contract.
-pub const CONTRACT_VERSION: u32 = 1;
+/// a plugin whose `/manifest` reports a contract outside
+/// [`MIN_CONTRACT`]`..=`[`CONTRACT_VERSION`].
+///
+/// - **2**: a plugin that consumes a manifest (nzb) no longer pulls it from the
+///   hull. It answers `/raw` (and its verify route) with `428` +
+///   [`HDR_NEEDS_MANIFEST`] until the hull has pushed one with
+///   `PUT /manifests/:cid`.
+pub const CONTRACT_VERSION: u32 = 2;
+/// The oldest contract the hull still drives (contract-1 nzb plugins pull their
+/// manifest from `/internal/nzb/manifest/:cid`, kept for one release).
+pub const MIN_CONTRACT: u32 = 1;
+
+/// `428` marker: this plugin needs the cid's manifest pushed before it can
+/// answer. The hull resolves the pointer, `PUT`s `/manifests/:cid`, and retries.
+pub const HDR_NEEDS_MANIFEST: &str = "x-metamesh-needs-manifest";
+
+/// Why a pointer could not be resolved, on a non-2xx `/ipfs-tier/resolve`
+/// answer: [`RESOLVE_NO_GATEWAY`], [`RESOLVE_UNCLAIMED`], [`RESOLVE_QUOTA`],
+/// [`RESOLVE_NOT_FOUND`] or [`RESOLVE_UPSTREAM`].
+pub const HDR_RESOLVE_ERROR: &str = "x-metamesh-resolve-error";
+/// No gateway is known at all yet (discovery is eventual): retry.
+pub const RESOLVE_NO_GATEWAY: &str = "no-gateway";
+/// Gateways are known, but none claims this pointer's key.
+pub const RESOLVE_UNCLAIMED: &str = "unclaimed";
+/// The provider's quota is spent: retry after `Retry-After`.
+pub const RESOLVE_QUOTA: &str = "quota";
+/// Every claiming gateway answered not found (or nothing is stored and the
+/// pointer cannot be redeemed).
+pub const RESOLVE_NOT_FOUND: &str = "not-found";
+/// A gateway failed, or answered bytes that did not verify.
+pub const RESOLVE_UPSTREAM: &str = "upstream";
 
 /// `X-MetaMesh-Lane`: the hull's lane decision for a `/raw` request.
 pub const HDR_LANE: &str = "x-metamesh-lane";

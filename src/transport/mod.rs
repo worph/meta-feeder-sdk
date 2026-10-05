@@ -22,6 +22,7 @@
 //! - [`torrent`]: the torrent plugin's extra routes + magnet helpers.
 //! - [`ipfs`]: the ipfs plugin's extra routes (the hull's blockstore/swarm facade).
 //! - [`nzb`]: Usenet cid shapes, the usenet plugin's extra routes + settings.
+//! - [`pointer`]: which cids are pointers (resolved before their bytes exist).
 //! - [`magic`]: content sniffing; [`file`]: range-serving a file off `/data`.
 //! - `testkit` (feature `testkit`): conformance checks for any implementation.
 //!
@@ -42,6 +43,7 @@ pub mod ipfs;
 pub mod magic;
 pub mod nzb;
 pub mod plugin;
+pub mod pointer;
 pub mod range;
 pub mod serve;
 pub mod torrent;
@@ -52,7 +54,7 @@ pub use client::RemoteTransport;
 pub use config::ConfigPlane;
 pub use dto::{
     Capabilities, Deleted, Event, Health, Job, Jobs, Manifest, PromotedFile, ReconcileReport,
-    ReconcileRequest, CONTRACT_VERSION,
+    ReconcileRequest, CONTRACT_VERSION, MIN_CONTRACT,
 };
 pub use error::ApiError;
 pub use focus::{FocusSnapshot, FocusTitle, FocusView, Lane};

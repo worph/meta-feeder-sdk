@@ -39,10 +39,11 @@ use super::dto::Event;
 /// Default hull callback base, matching the dev and store compose service name.
 pub const DEFAULT_HULL_URL: &str = "http://metashare-app:3001";
 
-/// Where the hull got a manifest: the record's `manifest` pointer, or a
-/// gateway redeem.
+/// Where a pointer's bytes came from: `store` (already held here, named by the
+/// record's pointer field), `redeem` (a gateway), or `record` (contract-1
+/// callback naming for `store`).
 pub const HDR_MANIFEST_SOURCE: &str = "x-metamesh-manifest-source";
-/// The content cid of a `record`-sourced manifest.
+/// The content cid the pointer resolved to.
 pub const HDR_MANIFEST_CID: &str = "x-metamesh-manifest-cid";
 
 /// `.nzb` bytes as the hull resolved them.

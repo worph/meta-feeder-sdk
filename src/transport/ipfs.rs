@@ -17,6 +17,7 @@
 //! |---|---|
 //! | `GET  peers` → [`PeersInfo`] | `swarm::Command::Peers` |
 //! | `GET  directory` → [`Directory`] | `swarm::PeerDirectory` (gateway discovery) |
+//! | `GET  resolve/:cid?hint=` → bytes | a [pointer](super::pointer)'s bytes: the stored copy `hint` names, else a gateway redeem (see below) |
 //! | `GET  local/:cid` (Range) → bytes / `404` | `files::bitswap::try_local_block` |
 //! | `GET  has/:cid` → [`Present`] | `block_store.get(cid).is_some()` |
 //! | `GET  complete/:cid` → [`Complete`] | `local_dag_complete` |
@@ -39,6 +40,15 @@
 //! (a bitswap fetch now seeds), [`Event::Promoted`](super::Event::Promoted) (an
 //! ingress job was renamed into `cache/`), and `GET /internal/records/:cid` for
 //! a display name.
+
+//! **Resolving a pointer** (`GET resolve/:cid`) is the one route that reaches
+//! outside the swarm: a pointer is answered only by a gateway holding the key,
+//! over plain HTTP at the gateway's base URL. Gateways come from config (the
+//! local one, pinned) and from the swarm directory; the fastest one whose redeem
+//! claim covers the pointer is asked first. `2xx` carries the bytes plus
+//! [`HDR_MANIFEST_SOURCE`](super::hull::HDR_MANIFEST_SOURCE) (`store` | `redeem`)
+//! and [`HDR_MANIFEST_CID`](super::hull::HDR_MANIFEST_CID); a failure carries
+//! [`HDR_RESOLVE_ERROR`](super::dto::HDR_RESOLVE_ERROR).
 
 use serde::{Deserialize, Serialize};
 
