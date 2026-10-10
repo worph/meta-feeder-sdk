@@ -1,6 +1,6 @@
 [package]
 name = "meta-feeder-sdk"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -37,11 +37,15 @@ default = ["feeder"]
 # FeederPlugin trait, hashing, the redb cache, the axum harness. On by default
 # so existing consumers build exactly what they always did.
 feeder = [
-    "beacon",
+    "beacon", "filename",
     "dep:axum", "dep:hyper", "dep:reqwest", "dep:base64", "dep:futures",
     "dep:async-trait", "dep:anyhow", "dep:thiserror", "dep:sha2", "dep:bytes",
-    "dep:regex", "dep:redb",
+    "dep:redb",
 ]
+# Release-name parsing (`src/filename_meta.rs`: clean_title, season/episode,
+# quality, codec). Needs only `regex`, so a client (meta-watch) can derive a
+# display name from a raw release string without the feeder machinery.
+filename = ["dep:regex"]
 # Beacon v2 local discovery (`src/beacon/`). Needs only tokio/serde/tracing/libc,
 # so a meta-* service takes the SDK with `default-features = false,
 # features = ["beacon"]` and pulls in none of the feeder machinery.

@@ -44,7 +44,7 @@ pub mod config;
 pub mod domain;
 #[cfg(feature = "feeder")]
 pub mod enrich;
-#[cfg(feature = "feeder")]
+#[cfg(feature = "filename")]
 pub mod filename_meta;
 #[cfg(feature = "feeder")]
 pub mod hash;
