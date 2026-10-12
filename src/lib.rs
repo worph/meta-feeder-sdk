@@ -52,6 +52,8 @@ pub mod hash;
 pub mod lang;
 #[cfg(feature = "feeder")]
 pub mod licence;
+/// Search-wire-transient `live/*` fields — always available, no dependencies.
+pub mod live;
 #[cfg(feature = "feeder")]
 pub mod meta_core;
 #[cfg(feature = "feeder")]

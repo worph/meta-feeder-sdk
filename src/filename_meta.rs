@@ -728,6 +728,159 @@ pub fn extract_codec(title: &str) -> Option<String> {
     Some(norm.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Release facts — `sourceMedium`, `releaseGroup`, `editions/*`, `flags/*`
+// (METADATA_KEYS §3). Durable properties of a release (unlike its seeders), so
+// they belong on the record; title-derived and best-effort like `quality` and
+// `codec`, so absence means "couldn't tell". Each returns a closed vocabulary
+// and drops what it does not recognise. The same functions normalise a
+// structured value an upstream already parsed (AIOStreams' `quality`
+// "BluRay REMUX", its editions "Director's Cut"), so the two paths agree.
+// ---------------------------------------------------------------------------
+
+/// Separators to spaces, the way every extractor here reads a title. Hyphens
+/// are kept: `WEB-DL`, `HD-Rip` and the `-GROUP` suffix need them.
+fn spaced(title: &str) -> String {
+    title.replace(['.', '_'], " ")
+}
+
+/// The medium the release was taken from, one of `cam`, `ts`, `tc`, `scr`,
+/// `bluray-remux`, `bluray`, `webrip`, `web-dl`, `hdrip`, `hdtv`, `dvd`.
+///
+/// Pre-release sources are tested first: `HDCAM` beats any `HD` token, and a
+/// `DVDSCR` is a screener, not a DVD. The bare `CAM`, `TS` and `TC` tokens only
+/// count in capitals: as words they are a film title (*Cam*, 2018), a file
+/// extension and an initialism too often.
+pub fn extract_source_medium(title: &str) -> Option<&'static str> {
+    static CI: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"(?i)\b(?:hd-?cam|cam-?rip)\b", "cam"),
+            (r"(?i)\b(?:telesync|hd-?ts|pdvd)\b", "ts"),
+            (r"(?i)\b(?:telecine|hd-?tc)\b", "tc"),
+            (r"(?i)\b(?:dvd-?scr|screener|scr)\b", "scr"),
+            (r"(?i)\b(?:bd-?remux|remux)\b", "bluray-remux"),
+            (r"(?i)\b(?:blu-?ray|bd-?rip|br-?rip|bdmv|bd25|bd50)\b", "bluray"),
+            (r"(?i)\bweb-?rip\b", "webrip"),
+            (r"(?i)\b(?:web-?dl|web)\b", "web-dl"),
+            (r"(?i)\bhd-?rip\b", "hdrip"),
+            (r"(?i)\b(?:hdtv|hdtvrip|uhdtv|pdtv|sdtv|tvrip|dsr)\b", "hdtv"),
+            (r"(?i)\b(?:dvd-?rip|dvd-?r|dvd5|dvd9|dvd)\b", "dvd"),
+        ]
+        .into_iter()
+        .map(|(re, v)| (Regex::new(re).expect("source re compiles"), v))
+        .collect()
+    });
+    static CAPS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [(r"\bCAM\b", "cam"), (r"\bTS\b", "ts"), (r"\bTC\b", "tc")]
+            .into_iter()
+            .map(|(re, v)| (Regex::new(re).expect("caps re compiles"), v))
+            .collect()
+    });
+    static DVD_REMUX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bdvd\S*\b.*\bremux\b|\bremux\b.*\bdvd").expect("dvd remux re"));
+    let t = spaced(title);
+    // A DVD remux is a DVD: `remux` alone names no disc.
+    if DVD_REMUX.is_match(&t) {
+        return Some("dvd");
+    }
+    CAPS.iter()
+        .find(|(re, _)| re.is_match(&t))
+        .or_else(|| CI.iter().find(|(re, _)| re.is_match(&t)))
+        .map(|(_, v)| *v)
+}
+
+/// The group that made the release: a leading `[Group]` (fansub style) or a
+/// trailing `-GROUP` (scene style), the same two rules as meta-watch's
+/// `parseVersion`. Trailing tracker tags (`[rarbg]`, `[TGx]`), a video
+/// extension and a usenet `-xpost` are removed first; a candidate that is
+/// really a format token (`WEB-DL` → `DL`, `x264`, `1080p`) is refused.
+pub fn extract_release_group(title: &str) -> Option<String> {
+    static LEADING: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*\[([^\[\]]{2,32})\]").expect("leading group re"));
+    static TRAILING: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"-\s*([A-Za-z0-9][A-Za-z0-9&@]{1,24})\s*$").expect("trailing group re"));
+    static TAIL_NOISE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:\s*(?:\[[^\]]*\]|\([^)]*\))|\.(?:mkv|mp4|avi|m4v|ts|m2ts|webm|wmv|mov)|-xpost)+\s*$")
+            .expect("tail noise re")
+    });
+    static FORMAT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:[xh]26[45]|hevc|avc|av1|\d{3,4}[pi]|s\d+(?:e\d+)?)$").expect("format re")
+    });
+    let not_a_format = |g: &str| {
+        let l = g.to_ascii_lowercase();
+        !(matches!(
+            l.as_str(),
+            "dl" | "rip" | "web" | "hd" | "hdr" | "dts" | "ac3" | "aac" | "remux" | "sample" | "eng" | "multi"
+        ) || l.chars().all(|c| c.is_ascii_digit())
+            || FORMAT.is_match(&l))
+    };
+    if let Some(g) = LEADING.captures(title).map(|c| c[1].trim().to_string()) {
+        // `[1080p]` or `[HEVC]` at the front is a tag, not a group.
+        if not_a_format(&g) && extract_quality(&g).is_none() {
+            return Some(g);
+        }
+    }
+    let mut t = title.trim().to_string();
+    loop {
+        let cut = TAIL_NOISE.replace(&t, "").trim_end().to_string();
+        if cut == t {
+            break;
+        }
+        t = cut;
+    }
+    TRAILING
+        .captures(&t)
+        .map(|c| c[1].to_string())
+        .filter(|g| not_a_format(g))
+}
+
+/// The cut of the work this release carries — `editions/<x>` members. A
+/// different cut has a different runtime, so these matter beyond a label
+/// (a subtitle synced to the theatrical cut drifts on the extended one).
+pub fn extract_editions(title: &str) -> BTreeSet<&'static str> {
+    static EDITIONS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"(?i)\bextended\b", "extended"),
+            (r"(?i)\bdirector'?s?[\s-]*cut\b", "directors-cut"),
+            (r"(?i)\btheatrical\b", "theatrical"),
+            (r"(?i)\bunrated\b", "unrated"),
+            (r"(?i)\buncut\b", "uncut"),
+            (r"(?i)\buncensored\b", "uncensored"),
+            (r"(?i)\bimax\b", "imax"),
+            (r"(?i)\bremaster(?:ed)?\b", "remastered"),
+            (r"(?i)\bcriterion\b", "criterion"),
+            (r"(?i)\banniversary\b", "anniversary"),
+            (r"(?i)\bcollector'?s\b", "collectors"),
+            (r"(?i)\bultimate[\s-]+(?:edition|cut)\b", "ultimate"),
+            (r"(?i)\bspecial[\s-]+edition\b", "special"),
+        ]
+        .into_iter()
+        .map(|(re, v)| (Regex::new(re).expect("edition re compiles"), v))
+        .collect()
+    });
+    let t = spaced(title);
+    EDITIONS.iter().filter(|(re, _)| re.is_match(&t)).map(|(_, v)| *v).collect()
+}
+
+/// Properties of the encode itself — `flags/<x>` members: `repack` and
+/// `proper` (a fixed re-release that supersedes the first), `upscaled` (the
+/// resolution is not the source's: a 2160 upscale is not 4K), `regraded`.
+pub fn extract_flags(title: &str) -> BTreeSet<&'static str> {
+    static FLAGS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"(?i)\b(?:repack\d?|rerip)\b", "repack"),
+            (r"(?i)\bproper\b", "proper"),
+            (r"(?i)\b(?:ai[\s-]*)?upscaled?\b", "upscaled"),
+            (r"(?i)\bregraded?\b", "regraded"),
+        ]
+        .into_iter()
+        .map(|(re, v)| (Regex::new(re).expect("flag re compiles"), v))
+        .collect()
+    });
+    let t = spaced(title);
+    FLAGS.iter().filter(|(re, _)| re.is_match(&t)).map(|(_, v)| *v).collect()
+}
+
 /// `removeKeywordsFromFilename` + `removeSFV` + `cleanSpecialChars` +
 /// `cleanSpace`, in that order.
 fn preclean(filename: &str) -> String {
@@ -934,6 +1087,61 @@ pub fn clean_title(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_medium_reads_real_release_names() {
+        let m = extract_source_medium;
+        assert_eq!(m("Game of Thrones S01E03 Lord Snow REPACK 1080p DTS-HD MA 5 1 AVC REMUX-FraMeSToR"), Some("bluray-remux"));
+        assert_eq!(m("The.Matrix.1999.1080p.BrRip.x264.YIFY.mp4"), Some("bluray"));
+        assert_eq!(m("Breaking.Bad.S02E04.Giu.1080p.NF.WEB-DL.DDP5.1.AV1-G66.mkv"), Some("web-dl"));
+        assert_eq!(m("Show.S01E01.1080p.WEB.H264-GROUP"), Some("web-dl"));
+        assert_eq!(m("[yolerejiju] Spy x Family Season 1 (S01) (WEBRip 1080p x265 10bit)"), Some("webrip"));
+        assert_eq!(m("Movie 2023 HC HD-Rip 720p"), Some("hdrip"));
+        assert_eq!(m("Some Show [2x10] HDTV"), Some("hdtv"));
+        assert_eq!(m("Old.Film.1985.DVDRip.XviD"), Some("dvd"));
+        assert_eq!(m("Old.Film.1985.DVD.REMUX"), Some("dvd"));
+        assert_eq!(m("New.Film.2024.HDCAM.x264"), Some("cam"));
+        assert_eq!(m("New Film 2024 CAM"), Some("cam"));
+        assert_eq!(m("New.Film.2024.DVDSCR.x264"), Some("scr"));
+        assert_eq!(m("New.Film.2024.TELESYNC"), Some("ts"));
+        // AIOStreams' structured vocabulary goes through the same door.
+        assert_eq!(m("BluRay REMUX"), Some("bluray-remux"));
+        assert_eq!(m("WEB-DL"), Some("web-dl"));
+        assert_eq!(m("TC"), Some("tc"));
+        // The film "Cam" and a lower-case "ts" are not sources.
+        assert_eq!(m("Cam (2018) 1080p"), None);
+        assert_eq!(m("its a ts file"), None);
+        assert_eq!(m("Movie 2019 1080p x264"), None);
+    }
+
+    #[test]
+    fn release_group_is_the_leading_bracket_or_trailing_dash() {
+        let g = |t: &str| extract_release_group(t);
+        assert_eq!(g("[yolerejiju] Spy x Family Season 1 (S01) (WEBRip 1080p x265 10bit)").as_deref(), Some("yolerejiju"));
+        assert_eq!(g("Breaking.Bad.S02E04.Giu.1080p.NF.WEB-DL.DDP5.1.AV1-G66.mkv").as_deref(), Some("G66"));
+        assert_eq!(g("Game of Thrones S01E03 Lord Snow REPACK 1080p DTS-HD MA 5 1 AVC REMUX-FraMeSToR").as_deref(), Some("FraMeSToR"));
+        assert_eq!(g("Oppenheimer.2023.1080p.BluRay.DD5.1.x264-GalaxyRG.mkv").as_deref(), Some("GalaxyRG"));
+        assert_eq!(g("Movie.2020.1080p.WEB-DL.x264-NTb[rarbg]").as_deref(), Some("NTb"));
+        assert_eq!(g("Breaking.Bad.S02E04.Down.1080p.BluRay.x264-OFT.mkv-xpost").as_deref(), Some("OFT"));
+        assert_eq!(g("Movie 2020 1080p WEB-DL [TGx]").as_deref(), None, "WEB-DL is not a group called DL");
+        assert_eq!(g("[1080p] Movie - 2020").as_deref(), None);
+        assert_eq!(g("Movie.2020.1080p.x264").as_deref(), None);
+    }
+
+    #[test]
+    fn editions_and_flags() {
+        let e = |t: &str| extract_editions(t).into_iter().collect::<Vec<_>>();
+        assert_eq!(e("Aliens.1986.Directors.Cut.1080p.BluRay"), ["directors-cut"]);
+        assert_eq!(e("LOTR.Fellowship.2001.EXTENDED.REMASTERED.2160p"), ["extended", "remastered"]);
+        assert_eq!(e("Director's Cut"), ["directors-cut"]);
+        assert_eq!(e("Ultimate Edition"), ["ultimate"]);
+        assert_eq!(e("Movie.2019.1080p.WEB-DL"), Vec::<&str>::new());
+        let f = |t: &str| extract_flags(t).into_iter().collect::<Vec<_>>();
+        assert_eq!(f("Game of Thrones S01E03 Lord Snow REPACK 1080p"), ["repack"]);
+        assert_eq!(f("Show.S01E01.PROPER.720p.HDTV"), ["proper"]);
+        assert_eq!(f("Movie 1999 2160p AI Upscaled Regrade"), ["regraded", "upscaled"]);
+        assert_eq!(f("The Proper Way 2020"), ["proper"], "a title word is indistinguishable — accepted noise");
+    }
 
     fn se(title: &str) -> (Option<String>, Option<String>) {
         let r = extract_season_episode(title);

@@ -80,6 +80,11 @@ pub fn build_metadata_body(
 ) -> BTreeMap<String, String> {
     let mut body: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in &record.fields {
+        // `live/*` (and the legacy bare swarm counters) are true only at query
+        // time; a self-publishing feeder must not freeze them into the hash.
+        if crate::live::is_transient(k) {
+            continue;
+        }
         if k.starts_with("cid_") && !v.is_empty() {
             body.insert(format!("cids/{v}"), "true".to_string());
         } else {
@@ -331,5 +336,17 @@ mod tests {
             Some("true")
         );
         assert!(body.contains_key("provenance"));
+    }
+
+    /// A self-publish never freezes swarm counters, in either spelling.
+    #[test]
+    fn body_drops_transient_fields() {
+        let mut r = rec();
+        for (k, v) in [("live/seeders", "42"), ("live/at", "1"), ("seeders", "7"), ("leechers", "2")] {
+            r.fields.insert(k.into(), v.into());
+        }
+        let body = build_metadata_body(&r, &Provenance::now("tribler", "abc", "peer"));
+        assert!(body.keys().all(|k| !crate::live::is_transient(k)), "{body:?}");
+        assert_eq!(body.get("title").map(String::as_str), Some("Big Buck Bunny"));
     }
 }
